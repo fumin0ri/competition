@@ -1,4 +1,9 @@
-"""Generate, checkpoint, validate, and load external text embeddings."""
+"""Generate, checkpoint, validate, and load text embeddings.
+
+The primary runtime is an Amazon SageMaker real-time endpoint. Request and
+response adapters are injectable because the endpoint contract may differ by
+the model container used by the competition team.
+"""
 
 from __future__ import annotations
 
@@ -23,6 +28,14 @@ Embedder: TypeAlias = Callable[
     [Sequence[str], Any, str, int | None],
     tuple[np.ndarray, Mapping[str, int]],
 ]
+SageMakerRequestBuilder: TypeAlias = Callable[
+    [Sequence[str], str, int | None],
+    bytes | str | Mapping[str, Any],
+]
+SageMakerResponseParser: TypeAlias = Callable[
+    [bytes, int],
+    np.ndarray | tuple[np.ndarray, Mapping[str, int]],
+]
 
 NORMALIZATION_VERSION = "nfkc_whitespace_v1"
 GEMINI_2_CLASSIFICATION_PREFIX = "task: classification | query: "
@@ -41,6 +54,10 @@ DEFAULT_TEXT_TEMPLATE = (
 # pages immediately before a paid run. Defaults reflect standard paid text
 # input pricing checked on 2026-08-24.
 DEFAULT_PRICE_PER_MILLION_TOKENS = {
+    # SageMaker endpoints are normally billed by instance uptime rather than
+    # request tokens. Keep zero as the safe default; an internal chargeback
+    # estimate can be supplied explicitly when needed.
+    "sagemaker": 0.0,
     "openai": 0.13,  # text-embedding-3-large
     "gemini": 0.20,  # gemini-embedding-2
 }
@@ -185,10 +202,10 @@ def _prepare_inputs(
             prepared.append(text)
             token_counts.append(len(tokens))
             truncated.append(was_truncated)
-    elif provider == "gemini":
-        # Gemini does not expose a local tokenizer. This conservative estimate
-        # is configurable; EmbedContentConfig(auto_truncate=True) is also used
-        # as the final provider-side guard.
+    elif provider in {"gemini", "sagemaker"}:
+        # These providers do not expose a model-independent local tokenizer.
+        # Use a configurable character estimate and truncate locally; a custom
+        # SageMaker request builder may add a provider-side truncation option.
         character_limit = max(1, int(max_input_tokens * gemini_chars_per_token))
         for text in provider_texts:
             estimated = max(1, math.ceil(len(text) / gemini_chars_per_token))
@@ -202,7 +219,7 @@ def _prepare_inputs(
             )
             truncated.append(was_truncated)
     else:
-        raise ValueError("provider must be 'openai' or 'gemini'.")
+        raise ValueError("provider must be 'sagemaker', 'openai', or 'gemini'.")
 
     details = pd.DataFrame(
         {
@@ -251,6 +268,141 @@ def create_gemini_client() -> Any:
     return genai.Client(api_key=api_key)
 
 
+def create_sagemaker_runtime_client(
+    region_name: str | None = None,
+    profile_name: str | None = None,
+) -> Any:
+    """Create a SageMaker Runtime client using the standard AWS credential chain.
+
+    Credentials are never accepted as arguments. Locally, boto3 can use an AWS
+    profile; on SageMaker it normally obtains temporary credentials from the
+    execution role automatically.
+    """
+    try:
+        import boto3
+    except ImportError as error:
+        raise ImportError("Install the boto3 package to invoke SageMaker.") from error
+    session = boto3.Session(profile_name=profile_name, region_name=region_name)
+    return session.client("sagemaker-runtime")
+
+
+def build_sagemaker_json_request(
+    texts: Sequence[str],
+    model: str,
+    embedding_dim: int | None,
+) -> Mapping[str, Any]:
+    """Build the default Hugging Face-style JSON request.
+
+    ``model`` and ``embedding_dim`` are intentionally not sent: a SageMaker
+    endpoint already identifies its deployed model, and container-specific
+    parameters should be added in a custom request builder.
+    """
+    del model, embedding_dim
+    return {"inputs": list(texts)}
+
+
+def _json_response_to_matrix(payload: Any, expected_rows: int) -> np.ndarray:
+    candidate = payload
+    if isinstance(candidate, Mapping):
+        for key in ("embeddings", "vectors", "predictions"):
+            if key in candidate:
+                candidate = candidate[key]
+                break
+        else:
+            data = candidate.get("data")
+            if isinstance(data, Sequence) and not isinstance(data, (str, bytes)):
+                if all(isinstance(item, Mapping) and "embedding" in item for item in data):
+                    candidate = [item["embedding"] for item in data]
+
+    if (
+        isinstance(candidate, Sequence)
+        and not isinstance(candidate, (str, bytes))
+        and candidate
+        and all(isinstance(item, Mapping) and "embedding" in item for item in candidate)
+    ):
+        candidate = [item["embedding"] for item in candidate]
+
+    matrix = np.asarray(candidate, dtype=np.float32)
+    if matrix.ndim == 1 and expected_rows == 1:
+        matrix = matrix.reshape(1, -1)
+    if matrix.ndim != 2 or matrix.shape[0] != expected_rows:
+        raise ValueError(
+            "SageMaker response does not contain one embedding per input. "
+            "Provide a custom response_parser for this endpoint contract."
+        )
+    return matrix
+
+
+def parse_sagemaker_json_response(
+    body: bytes,
+    expected_rows: int,
+) -> np.ndarray:
+    """Parse common JSON embedding response shapes from a SageMaker endpoint."""
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(
+            "SageMaker response is not valid UTF-8 JSON. Provide a custom "
+            "response_parser for this endpoint contract."
+        ) from error
+    return _json_response_to_matrix(payload, expected_rows)
+
+
+def embed_sagemaker(
+    texts: Sequence[str],
+    client: Any,
+    model: str,
+    embedding_dim: int | None,
+    *,
+    endpoint_name: str,
+    content_type: str = "application/json",
+    accept: str = "application/json",
+    request_builder: SageMakerRequestBuilder = build_sagemaker_json_request,
+    response_parser: SageMakerResponseParser = parse_sagemaker_json_response,
+    invoke_endpoint_kwargs: Mapping[str, Any] | None = None,
+) -> tuple[np.ndarray, Mapping[str, int]]:
+    """Invoke one SageMaker endpoint batch through replaceable adapters."""
+    if not endpoint_name:
+        raise ValueError("endpoint_name is required for SageMaker invocation.")
+    extra = dict(invoke_endpoint_kwargs or {})
+    reserved = {"EndpointName", "Body", "ContentType", "Accept"}.intersection(extra)
+    if reserved:
+        raise ValueError(
+            f"invoke_endpoint_kwargs may not override reserved keys: {sorted(reserved)}"
+        )
+
+    request = request_builder(texts, model, embedding_dim)
+    if isinstance(request, Mapping):
+        body: bytes | str = json.dumps(request, ensure_ascii=False).encode("utf-8")
+    elif isinstance(request, (bytes, str)):
+        body = request
+    else:
+        raise TypeError("request_builder must return bytes, str, or a mapping.")
+
+    response = client.invoke_endpoint(
+        EndpointName=endpoint_name,
+        Body=body,
+        ContentType=content_type,
+        Accept=accept,
+        **extra,
+    )
+    response_body = response.get("Body") if isinstance(response, Mapping) else None
+    if response_body is None:
+        raise ValueError("SageMaker response does not contain Body.")
+    raw = response_body.read() if hasattr(response_body, "read") else response_body
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8")
+    if not isinstance(raw, bytes):
+        raise TypeError("SageMaker response Body must be bytes, str, or a readable stream.")
+
+    parsed = response_parser(raw, len(texts))
+    if isinstance(parsed, tuple):
+        matrix, usage = parsed
+    else:
+        matrix, usage = parsed, {}
+    return np.asarray(matrix, dtype=np.float32), usage
+
+
 def list_embedding_models(provider: str, client: Any | None = None) -> list[str]:
     """List embedding-like model IDs visible to the configured account."""
     provider = provider.lower()
@@ -263,8 +415,13 @@ def list_embedding_models(provider: str, client: Any | None = None) -> list[str]
             getattr(model, "name", "")
             for model in client.models.list()
         ]
+    elif provider == "sagemaker":
+        raise ValueError(
+            "SageMaker uses a deployed endpoint name rather than a discoverable "
+            "embedding model catalog."
+        )
     else:
-        raise ValueError("provider must be 'openai' or 'gemini'.")
+        raise ValueError("provider must be 'sagemaker', 'openai', or 'gemini'.")
     return sorted(model_id for model_id in model_ids if "embed" in model_id.lower())
 
 
@@ -342,6 +499,14 @@ def _exception_status(error: Exception) -> int | None:
                 return int(value)
         except (TypeError, ValueError):
             pass
+    response = getattr(error, "response", None)
+    if isinstance(response, Mapping):
+        metadata = response.get("ResponseMetadata", {})
+        if isinstance(metadata, Mapping):
+            try:
+                return int(metadata.get("HTTPStatusCode"))
+            except (TypeError, ValueError):
+                pass
     return None
 
 
@@ -383,8 +548,9 @@ def _embedding_config(
     max_input_tokens: int,
     gemini_chars_per_token: float,
     batch_size: int,
+    provider_config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    config = {
         "provider": provider,
         "model": model,
         "embedding_dim": embedding_dim,
@@ -398,6 +564,9 @@ def _embedding_config(
         "batch_size": batch_size,
         "gemini_2_task_format": GEMINI_2_CLASSIFICATION_PREFIX,
     }
+    if provider_config:
+        config["provider_config"] = dict(provider_config)
+    return config
 
 
 def _config_fingerprint(config: Mapping[str, Any]) -> str:
@@ -530,7 +699,10 @@ def _print_dry_run(report: Mapping[str, Any]) -> None:
     print("Embedding dry run (API is not called)")
     for key, value in report.items():
         print(f"{key}: {value}")
-    print("Verify price_per_million_tokens against the official pricing page before running.")
+    if report.get("provider") == "sagemaker":
+        print("SageMaker endpoint instance cost is not represented by the token estimate.")
+    else:
+        print("Verify price_per_million_tokens against the official pricing page before running.")
 
 
 def generate_embeddings(
@@ -542,7 +714,7 @@ def generate_embeddings(
     text_cols: Sequence[str] = DEFAULT_TEXT_COLS,
     text_template: str | None = DEFAULT_TEXT_TEMPLATE,
     project_id_col: str = "project_id",
-    target_col: str = "target",
+    target_col: str = "science_tech_decision",
     embedding_dim: int | None = 1536,
     batch_size: int = 32,
     max_retries: int = 6,
@@ -554,6 +726,16 @@ def generate_embeddings(
     dry_run: bool = True,
     client: Any | None = None,
     embedder: Embedder | None = None,
+    endpoint_name: str | None = None,
+    region_name: str | None = None,
+    aws_profile_name: str | None = None,
+    content_type: str = "application/json",
+    accept: str = "application/json",
+    request_builder: SageMakerRequestBuilder = build_sagemaker_json_request,
+    response_parser: SageMakerResponseParser = parse_sagemaker_json_response,
+    invoke_endpoint_kwargs: Mapping[str, Any] | None = None,
+    adapter_id: str = "json-inputs-v1",
+    sagemaker_cache_identity: Mapping[str, Any] | None = None,
     show_progress: bool = True,
 ) -> dict[str, Any]:
     """Generate resumable embeddings and save all artifacts below output_root.
@@ -562,8 +744,17 @@ def generate_embeddings(
     to an API. In dry-run mode no client is initialized and no API is called.
     """
     provider = provider.lower()
-    if provider not in {"openai", "gemini"}:
-        raise ValueError("provider must be 'openai' or 'gemini'.")
+    if provider not in {"sagemaker", "openai", "gemini"}:
+        raise ValueError("provider must be 'sagemaker', 'openai', or 'gemini'.")
+    if provider == "sagemaker":
+        endpoint_name = endpoint_name or os.environ.get("SAGEMAKER_ENDPOINT_NAME")
+        if not adapter_id.strip():
+            raise ValueError("adapter_id must be a non-empty cache version string.")
+        if invoke_endpoint_kwargs and not sagemaker_cache_identity:
+            raise ValueError(
+                "sagemaker_cache_identity is required when invoke_endpoint_kwargs "
+                "may change which model or variant produces the embeddings."
+            )
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", split):
         raise ValueError("split may contain only letters, numbers, _, ., and -.")
     if target_col in text_cols:
@@ -612,6 +803,14 @@ def generate_embeddings(
         "estimated_cost_usd": estimated_cost,
         "max_budget_usd": max_budget_usd,
     }
+    if provider == "sagemaker":
+        report.update(
+            {
+                "endpoint_name": endpoint_name,
+                "region_name": region_name,
+                "adapter_id": adapter_id,
+            }
+        )
     if dry_run:
         _print_dry_run(report)
         return {
@@ -620,6 +819,20 @@ def generate_embeddings(
             "cache_dir": None,
             "report": report,
             "from_cache": False,
+        }
+    if provider == "sagemaker" and embedder is None and not endpoint_name:
+        raise ValueError(
+            "endpoint_name or SAGEMAKER_ENDPOINT_NAME is required when dry_run=False."
+        )
+    provider_config: dict[str, Any] | None = None
+    if provider == "sagemaker":
+        provider_config = {
+            "endpoint_name": endpoint_name,
+            "region_name": region_name,
+            "content_type": content_type,
+            "accept": accept,
+            "adapter_id": adapter_id,
+            "cache_identity": dict(sagemaker_cache_identity or {}),
         }
     config = _embedding_config(
         provider=provider,
@@ -632,6 +845,7 @@ def generate_embeddings(
         max_input_tokens=max_input_tokens,
         gemini_chars_per_token=gemini_chars_per_token,
         batch_size=batch_size,
+        provider_config=provider_config,
     )
     fingerprint = _config_fingerprint(config)
     cache_dir = _resolve_cache_dir(output_root, config)
@@ -675,9 +889,41 @@ def generate_embeddings(
         )
 
     if client is None:
-        client = create_openai_client() if provider == "openai" else create_gemini_client()
+        if provider == "sagemaker":
+            client = create_sagemaker_runtime_client(
+                region_name=region_name,
+                profile_name=aws_profile_name,
+            )
+        elif provider == "openai":
+            client = create_openai_client()
+        else:
+            client = create_gemini_client()
     if embedder is None:
-        embedder = embed_openai if provider == "openai" else embed_gemini
+        if provider == "sagemaker":
+            def sagemaker_embedder(
+                batch_texts: Sequence[str],
+                runtime_client: Any,
+                selected_model: str,
+                selected_dimension: int | None,
+            ) -> tuple[np.ndarray, Mapping[str, int]]:
+                return embed_sagemaker(
+                    batch_texts,
+                    runtime_client,
+                    selected_model,
+                    selected_dimension,
+                    endpoint_name=endpoint_name,
+                    content_type=content_type,
+                    accept=accept,
+                    request_builder=request_builder,
+                    response_parser=response_parser,
+                    invoke_endpoint_kwargs=invoke_endpoint_kwargs,
+                )
+
+            embedder = sagemaker_embedder
+        elif provider == "openai":
+            embedder = embed_openai
+        else:
+            embedder = embed_gemini
 
     ranges = _batch_ranges(details["estimated_tokens"].tolist(), batch_size, provider)
     shard_dir = cache_dir / "shards" / split
@@ -881,15 +1127,19 @@ __all__ = [
     "DEFAULT_TEXT_COLS",
     "DEFAULT_TEXT_TEMPLATE",
     "build_embedding_text",
+    "build_sagemaker_json_request",
     "create_gemini_client",
     "create_openai_client",
+    "create_sagemaker_runtime_client",
     "embed_gemini",
     "embed_openai",
+    "embed_sagemaker",
     "generate_embeddings",
     "l2_normalize_embeddings",
     "list_embedding_models",
     "load_embeddings",
     "normalize_embedding_text",
+    "parse_sagemaker_json_response",
     "text_sha256",
     "verify_embedding_alignment",
 ]

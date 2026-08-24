@@ -1,3 +1,5 @@
+import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,6 +9,7 @@ import pandas as pd
 
 from embedding_features import (
     build_embedding_text,
+    embed_sagemaker,
     generate_embeddings,
     l2_normalize_embeddings,
     load_embeddings,
@@ -22,7 +25,7 @@ class EmbeddingFeatureTests(unittest.TestCase):
                 "project_name": ["宇宙  開発", None, "量子", "海洋", "AI"],
                 "project_objective": ["目的A", "", "目的C", "目的D", "目的E"],
                 "project_summary": ["概要A", None, "概要C", "概要D", "概要E"],
-                "target": [1, 0, 1, 0, 1],
+                "science_tech_decision": [1, 0, 1, 0, 1],
             },
             index=[10, 20, 30, 40, 50],
         )
@@ -46,6 +49,117 @@ class EmbeddingFeatureTests(unittest.TestCase):
         )
         self.assertEqual(build_embedding_text(empty), "[EMPTY]")
 
+    def test_sagemaker_default_adapter_invokes_realtime_endpoint(self):
+        class RuntimeClient:
+            def __init__(self):
+                self.calls = []
+
+            def invoke_endpoint(self, **kwargs):
+                self.calls.append(kwargs)
+                request = json.loads(kwargs["Body"].decode("utf-8"))
+                vectors = [[float(len(text)), 1.0, 2.0] for text in request["inputs"]]
+                return {"Body": io.BytesIO(json.dumps({"embeddings": vectors}).encode())}
+
+        runtime = RuntimeClient()
+        matrix, usage = embed_sagemaker(
+            ["a", "日本語"],
+            runtime,
+            "jp-embedding-v1",
+            3,
+            endpoint_name="competition-embedding-endpoint",
+        )
+        self.assertEqual(matrix.shape, (2, 3))
+        self.assertEqual(usage, {})
+        self.assertEqual(len(runtime.calls), 1)
+        self.assertEqual(
+            runtime.calls[0]["EndpointName"], "competition-embedding-endpoint"
+        )
+        self.assertEqual(runtime.calls[0]["ContentType"], "application/json")
+
+    def test_sagemaker_custom_request_and_response_adapters(self):
+        class RuntimeClient:
+            def invoke_endpoint(self, **kwargs):
+                request = json.loads(kwargs["Body"].decode("utf-8"))
+                self.request = request
+                self.kwargs = kwargs
+                response = {"result": [[3.0, 4.0] for _ in request["sentences"]]}
+                return {"Body": io.BytesIO(json.dumps(response).encode())}
+
+        runtime = RuntimeClient()
+
+        def request_builder(texts, model, embedding_dim):
+            return {
+                "sentences": list(texts),
+                "parameters": {"model": model, "dimension": embedding_dim},
+            }
+
+        def response_parser(body, expected_rows):
+            payload = json.loads(body.decode("utf-8"))
+            self.assertEqual(len(payload["result"]), expected_rows)
+            return np.asarray(payload["result"], dtype=np.float32), {"total_tokens": 7}
+
+        matrix, usage = embed_sagemaker(
+            ["one", "two"],
+            runtime,
+            "custom-model-contract",
+            2,
+            endpoint_name="custom-endpoint",
+            request_builder=request_builder,
+            response_parser=response_parser,
+            invoke_endpoint_kwargs={"TargetVariant": "variant-b"},
+        )
+        np.testing.assert_allclose(matrix, [[3.0, 4.0], [3.0, 4.0]])
+        self.assertEqual(usage["total_tokens"], 7)
+        self.assertEqual(runtime.request["parameters"]["dimension"], 2)
+        self.assertEqual(runtime.kwargs["TargetVariant"], "variant-b")
+
+    def test_sagemaker_generate_uses_endpoint_and_adapter_cache_identity(self):
+        class RuntimeClient:
+            def invoke_endpoint(self, **kwargs):
+                request = json.loads(kwargs["Body"].decode("utf-8"))
+                vectors = [[1.0, 2.0, 3.0] for _ in request["inputs"]]
+                return {"Body": io.BytesIO(json.dumps(vectors).encode())}
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = generate_embeddings(
+                self.frame,
+                split="train",
+                provider="sagemaker",
+                model="jp-embedding-v1",
+                endpoint_name="competition-embedding-endpoint",
+                region_name="ap-northeast-1",
+                adapter_id="json-inputs-v1",
+                output_root=directory,
+                embedding_dim=3,
+                batch_size=2,
+                dry_run=False,
+                client=RuntimeClient(),
+                show_progress=False,
+            )
+            self.assertEqual(result["embeddings"].shape, (5, 3))
+            config = json.loads(
+                (result["cache_dir"] / "config.json").read_text(encoding="utf-8")
+            )
+            provider_config = config["provider_config"]
+            self.assertEqual(
+                provider_config["endpoint_name"], "competition-embedding-endpoint"
+            )
+            self.assertEqual(provider_config["adapter_id"], "json-inputs-v1")
+
+    def test_sagemaker_invoke_options_require_explicit_cache_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "sagemaker_cache_identity"):
+                generate_embeddings(
+                    self.frame,
+                    split="train",
+                    provider="sagemaker",
+                    model="jp-embedding-v1",
+                    output_root=directory,
+                    dry_run=True,
+                    invoke_endpoint_kwargs={"TargetVariant": "variant-b"},
+                    show_progress=False,
+                )
+
     def test_dry_run_does_not_call_api_or_write_cache(self):
         def must_not_run(*args, **kwargs):
             raise AssertionError("API embedder was called during dry-run")
@@ -54,8 +168,8 @@ class EmbeddingFeatureTests(unittest.TestCase):
             result = generate_embeddings(
                 self.frame,
                 split="train",
-                provider="gemini",
-                model="gemini-embedding-2",
+                provider="sagemaker",
+                model="jp-embedding-v1",
                 output_root=directory,
                 embedding_dim=3,
                 dry_run=True,
@@ -76,8 +190,8 @@ class EmbeddingFeatureTests(unittest.TestCase):
             result = generate_embeddings(
                 self.frame,
                 split="train",
-                provider="gemini",
-                model="gemini-embedding-2",
+                provider="sagemaker",
+                model="jp-embedding-v1",
                 output_root=directory,
                 embedding_dim=3,
                 batch_size=2,
@@ -121,8 +235,8 @@ class EmbeddingFeatureTests(unittest.TestCase):
             cached = generate_embeddings(
                 self.frame,
                 split="train",
-                provider="gemini",
-                model="gemini-embedding-2",
+                provider="sagemaker",
+                model="jp-embedding-v1",
                 output_root=directory,
                 embedding_dim=3,
                 batch_size=2,
@@ -145,8 +259,8 @@ class EmbeddingFeatureTests(unittest.TestCase):
             first = generate_embeddings(
                 self.frame,
                 split="train",
-                provider="gemini",
-                model="gemini-embedding-2",
+                provider="sagemaker",
+                model="jp-embedding-v1",
                 output_root=directory,
                 embedding_dim=3,
                 batch_size=5,
@@ -161,8 +275,8 @@ class EmbeddingFeatureTests(unittest.TestCase):
                 generate_embeddings(
                     changed,
                     split="train",
-                    provider="gemini",
-                    model="gemini-embedding-2",
+                    provider="sagemaker",
+                    model="jp-embedding-v1",
                     output_root=directory,
                     embedding_dim=3,
                     batch_size=5,
@@ -187,8 +301,8 @@ class EmbeddingFeatureTests(unittest.TestCase):
                 generate_embeddings(
                     self.frame,
                     split="train",
-                    provider="gemini",
-                    model="gemini-embedding-2",
+                    provider="sagemaker",
+                    model="jp-embedding-v1",
                     output_root=directory,
                     embedding_dim=3,
                     batch_size=2,
@@ -208,8 +322,8 @@ class EmbeddingFeatureTests(unittest.TestCase):
             resumed = generate_embeddings(
                 self.frame,
                 split="train",
-                provider="gemini",
-                model="gemini-embedding-2",
+                provider="sagemaker",
+                model="jp-embedding-v1",
                 output_root=directory,
                 embedding_dim=3,
                 batch_size=2,
@@ -229,10 +343,10 @@ class EmbeddingFeatureTests(unittest.TestCase):
                 generate_embeddings(
                     self.frame,
                     split="train",
-                    provider="gemini",
-                    model="gemini-embedding-2",
+                    provider="sagemaker",
+                    model="jp-embedding-v1",
                     output_root=directory,
-                    text_cols=["project_name", "target"],
+                    text_cols=["project_name", "science_tech_decision"],
                     dry_run=True,
                     show_progress=False,
                 )
