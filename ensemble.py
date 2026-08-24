@@ -21,6 +21,11 @@ class HillClimbingEnsembleResult:
     individual_scores: pd.Series
     history: pd.DataFrame
     n_scored_rows: int
+    objective: str
+    blend_mode: str
+    pooled_auc: float
+    fold_scores: pd.DataFrame
+    fold_weights: pd.Series
 
 
 def _resolve_target(target: pd.Series | Sequence[int], index: pd.Index) -> pd.Series:
@@ -81,22 +86,109 @@ def _validate_oof_candidates(
     return scored, scored_target, reference_mask
 
 
+def _resolve_fold_membership(
+    index: pd.Index,
+    scored_mask: pd.Series,
+    folds: Sequence[tuple[pd.Index, pd.Index]] | None,
+) -> pd.Series:
+    if folds is None or len(folds) == 0:
+        raise ValueError("folds are required for fold objectives and rank blending.")
+    membership = pd.Series(-1, index=index, dtype=int, name="fold")
+    for fold_number, (_, valid_idx) in enumerate(folds):
+        labels = pd.Index(valid_idx)
+        positions = index.get_indexer(labels)
+        if (positions < 0).any():
+            raise KeyError(f"Fold {fold_number} contains labels missing from OOF index.")
+        if membership.loc[labels].ne(-1).any():
+            raise ValueError("Validation folds must not overlap.")
+        membership.loc[labels] = fold_number
+    expected = membership.ge(0)
+    if not expected.equals(scored_mask):
+        raise ValueError(
+            "Validation fold rows must exactly match the rows containing OOF predictions."
+        )
+    return membership.loc[scored_mask]
+
+
+def _normalize_fold_weights(
+    objective: str,
+    n_folds: int,
+    fold_weights: Sequence[float] | None,
+) -> np.ndarray:
+    if objective == "pooled_auc":
+        if fold_weights is not None:
+            raise ValueError("fold_weights are only valid for weighted_fold_auc.")
+        return np.full(n_folds, np.nan, dtype=float)
+    if objective == "mean_fold_auc":
+        if fold_weights is not None:
+            raise ValueError("fold_weights are only valid for weighted_fold_auc.")
+        return np.full(n_folds, 1.0 / n_folds, dtype=float)
+    if fold_weights is None:
+        raise ValueError("weighted_fold_auc requires fold_weights.")
+    values = np.asarray(list(fold_weights), dtype=float)
+    if values.ndim != 1 or len(values) != n_folds:
+        raise ValueError(f"fold_weights must contain exactly {n_folds} values.")
+    if not np.isfinite(values).all() or (values < 0).any() or values.sum() <= 0:
+        raise ValueError("fold_weights must be finite, non-negative, and sum above zero.")
+    return values / values.sum()
+
+
+def _rank_candidates_by_fold(
+    predictions: pd.DataFrame,
+    membership: pd.Series,
+) -> pd.DataFrame:
+    ranked = pd.DataFrame(index=predictions.index, columns=predictions.columns, dtype=float)
+    for fold_number in sorted(membership.unique()):
+        mask = membership.eq(fold_number)
+        ranked.loc[mask] = predictions.loc[mask].rank(method="average", pct=True)
+    return ranked
+
+
+def _fold_auc_values(
+    target: pd.Series,
+    prediction: np.ndarray,
+    membership: pd.Series,
+) -> np.ndarray:
+    values: list[float] = []
+    for fold_number in sorted(membership.unique()):
+        mask = membership.eq(fold_number).to_numpy()
+        fold_target = target.to_numpy()[mask]
+        if np.unique(fold_target).size < 2:
+            raise ValueError(
+                f"Fold {fold_number} has one target class; fold ROC-AUC is undefined."
+            )
+        values.append(float(roc_auc_score(fold_target, prediction[mask])))
+    return np.asarray(values, dtype=float)
+
+
 def hill_climb_auc(
     oof_predictions: pd.DataFrame,
     target: pd.Series | Sequence[int],
     *,
     candidate_models: Sequence[str] | None = None,
+    folds: Sequence[tuple[pd.Index, pd.Index]] | None = None,
+    objective: str = "pooled_auc",
+    fold_weights: Sequence[float] | None = None,
+    blend_mode: str = "probability",
     max_steps: int = 50,
     weight_grid: Sequence[float] | None = None,
     min_improvement: float = 1e-6,
 ) -> HillClimbingEnsembleResult:
-    """Greedily maximize pooled OOF ROC-AUC with convex prediction blends.
+    """Greedily maximize a pooled or fold-wise OOF ROC-AUC objective.
 
     The best individual model initializes the ensemble. At each step the function
     searches every candidate and mixing coefficient ``alpha`` using
     ``(1 - alpha) * current + alpha * candidate``. The search stops when no trial
-    improves ROC-AUC by at least ``min_improvement``.
+    improves the selected objective by at least ``min_improvement``. Rank blending
+    converts each base model to percentile ranks independently inside each fold.
     """
+    objective = objective.lower()
+    supported_objectives = {"pooled_auc", "mean_fold_auc", "weighted_fold_auc"}
+    if objective not in supported_objectives:
+        raise ValueError(f"objective must be one of {sorted(supported_objectives)}.")
+    blend_mode = blend_mode.lower()
+    if blend_mode not in {"probability", "rank"}:
+        raise ValueError("blend_mode must be 'probability' or 'rank'.")
     if max_steps < 0:
         raise ValueError("max_steps must be non-negative.")
     if min_improvement < 0:
@@ -114,26 +206,51 @@ def hill_climb_auc(
     scored, scored_target, scored_mask = _validate_oof_candidates(
         oof_predictions, target, candidate_models
     )
+    needs_folds = objective != "pooled_auc" or blend_mode == "rank"
+    if folds is not None:
+        membership = _resolve_fold_membership(
+            oof_predictions.index, scored_mask, folds
+        )
+    elif needs_folds:
+        raise ValueError("folds are required for fold objectives and rank blending.")
+    else:
+        membership = pd.Series(0, index=scored.index, dtype=int, name="fold")
+    n_folds = int(membership.nunique())
+    normalized_fold_weights = _normalize_fold_weights(
+        objective, n_folds, fold_weights
+    )
+    candidates = (
+        _rank_candidates_by_fold(scored, membership)
+        if blend_mode == "rank"
+        else scored
+    )
+
+    def objective_score(prediction: np.ndarray) -> float:
+        if objective == "pooled_auc":
+            return float(roc_auc_score(scored_target, prediction))
+        scores = _fold_auc_values(scored_target, prediction, membership)
+        return float(np.dot(normalized_fold_weights, scores))
+
     individual_scores = pd.Series(
         {
-            name: float(roc_auc_score(scored_target, scored[name]))
-            for name in scored.columns
+            name: objective_score(candidates[name].to_numpy(dtype=float, copy=False))
+            for name in candidates.columns
         },
-        name="oof_auc",
+        name=objective,
         dtype=float,
     )
     # idxmax is deterministic and preserves the caller's model order on ties.
     initial_model = str(individual_scores.idxmax())
-    current = scored[initial_model].to_numpy(dtype=float, copy=True)
+    current = candidates[initial_model].to_numpy(dtype=float, copy=True)
     current_score = float(individual_scores.loc[initial_model])
-    weights = pd.Series(0.0, index=scored.columns, name="weight")
+    weights = pd.Series(0.0, index=candidates.columns, name="weight")
     weights.loc[initial_model] = 1.0
     history: list[dict[str, float | int | str]] = [
         {
             "step": 0,
             "added_model": initial_model,
             "alpha": 1.0,
-            "oof_auc": current_score,
+            "objective_score": current_score,
             "improvement": np.nan,
         }
     ]
@@ -143,11 +260,11 @@ def hill_climb_auc(
         best_model: str | None = None
         best_alpha: float | None = None
         best_prediction: np.ndarray | None = None
-        for name in scored.columns:
-            candidate = scored[name].to_numpy(dtype=float, copy=False)
+        for name in candidates.columns:
+            candidate = candidates[name].to_numpy(dtype=float, copy=False)
             for alpha in grid:
                 trial = (1.0 - alpha) * current + alpha * candidate
-                trial_score = float(roc_auc_score(scored_target, trial))
+                trial_score = objective_score(trial)
                 if trial_score > best_score + min_improvement:
                     best_score = trial_score
                     best_model = str(name)
@@ -166,7 +283,7 @@ def hill_climb_auc(
                 "step": step,
                 "added_model": best_model,
                 "alpha": best_alpha,
-                "oof_auc": current_score,
+                "objective_score": current_score,
                 "improvement": improvement,
             }
         )
@@ -180,6 +297,24 @@ def hill_climb_auc(
         dtype=float,
     )
     full_oof.loc[scored_mask] = current
+    final_fold_auc = _fold_auc_values(scored_target, current, membership)
+    fold_weight_values = (
+        np.full(n_folds, np.nan, dtype=float)
+        if objective == "pooled_auc"
+        else normalized_fold_weights
+    )
+    fold_scores = pd.DataFrame(
+        {
+            "fold": np.arange(n_folds, dtype=int),
+            "roc_auc": final_fold_auc,
+            "objective_weight": fold_weight_values,
+        }
+    )
+    fold_weight_series = pd.Series(
+        fold_weight_values,
+        index=pd.Index(range(n_folds), name="fold"),
+        name="objective_weight",
+    )
     return HillClimbingEnsembleResult(
         weights=weights,
         oof_prediction=full_oof,
@@ -187,14 +322,24 @@ def hill_climb_auc(
         individual_scores=individual_scores.sort_values(ascending=False),
         history=pd.DataFrame(history),
         n_scored_rows=int(scored_mask.sum()),
+        objective=objective,
+        blend_mode=blend_mode,
+        pooled_auc=float(roc_auc_score(scored_target, current)),
+        fold_scores=fold_scores,
+        fold_weights=fold_weight_series,
     )
 
 
 def blend_test_predictions(
     test_predictions: Mapping[str, Sequence[float]],
     weights: Mapping[str, float] | pd.Series,
+    *,
+    blend_mode: str = "probability",
 ) -> np.ndarray:
-    """Apply fitted ensemble weights to aligned test probabilities."""
+    """Apply fitted ensemble weights to aligned probability or rank predictions."""
+    blend_mode = blend_mode.lower()
+    if blend_mode not in {"probability", "rank"}:
+        raise ValueError("blend_mode must be 'probability' or 'rank'.")
     weight_series = pd.Series(dict(weights), dtype=float)
     weight_series = weight_series[weight_series > 0]
     if weight_series.empty or not np.isfinite(weight_series).all():
@@ -215,6 +360,8 @@ def blend_test_predictions(
             raise ValueError("All test prediction arrays must have the same length.")
         if not np.isfinite(values).all() or ((values < 0) | (values > 1)).any():
             raise ValueError(f"Test prediction for {name!r} is not valid probability data.")
+        if blend_mode == "rank":
+            values = pd.Series(values).rank(method="average", pct=True).to_numpy()
         arrays.append(values)
 
     normalized_weights = weight_series.to_numpy() / weight_series.sum()
@@ -325,10 +472,27 @@ def save_ensemble_outputs(
     paths = {
         "weights": directory / "ensemble_weights.csv",
         "history": directory / "ensemble_history.csv",
+        "fold_scores": directory / "ensemble_fold_scores.csv",
+        "summary": directory / "ensemble_summary.csv",
         "oof": directory / "ensemble_oof.parquet",
     }
     result.weights.rename("weight").to_csv(paths["weights"], index_label="experiment")
     result.history.to_csv(paths["history"], index=False)
+    result.fold_scores.to_csv(paths["fold_scores"], index=False)
+    pd.DataFrame(
+        [
+            {
+                "objective": result.objective,
+                "blend_mode": result.blend_mode,
+                "objective_score": result.score,
+                "pooled_auc": result.pooled_auc,
+                "mean_fold_auc": result.fold_scores["roc_auc"].mean(),
+                "latest_fold_auc": result.fold_scores.iloc[-1]["roc_auc"],
+                "n_models": int(result.weights.gt(0).sum()),
+                "n_scored_rows": result.n_scored_rows,
+            }
+        ]
+    ).to_csv(paths["summary"], index=False)
     result.oof_prediction.to_frame().to_parquet(paths["oof"], index=True)
     return paths
 

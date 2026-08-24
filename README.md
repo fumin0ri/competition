@@ -242,6 +242,12 @@ CONFIG["catboost"]["task_type"] = "CPU"
 CONFIG["xgboost"]["device"] = "cpu"
 ```
 
+コンペ指標に合わせ、early stoppingもROC-AUC基準です。CatBoostは`loss_function="Logloss", eval_metric="AUC"`、XGBoostは`objective="binary:logistic", eval_metric="auc"`を使います。MLPは`BCEWithLogitsLoss`で学習しつつ、`early_stop_metric="auc"`でbest epochを選びます。MLPのfold diagnosticsには選択epochの`best_validation_auc`と`best_validation_loss`を両方残します。比較目的でBCE基準へ戻す場合だけ、次を指定します。
+
+```python
+CONFIG["mlp"]["early_stop_metric"] = "loss"
+```
+
 E1/E2のLRは、denseなEmbeddingと中規模の特徴数に対する堅実なbaselineとして`lbfgs`を既定にしています。Embeddingがほぼ全要素non-zeroなので、CSR化によるindex領域の増加を避け、OneHotを含めて`float32`のdense結合を使います。高cardinalityカテゴリを大量に追加する場合は入力次元と表示されるメモリ警告を確認してください。
 
 T1〜T3のLRは、行数より特徴数が多い高次元疎行列を想定して`liblinear, dual=True`を既定にしています。収束警告が出る場合は`CONFIG["tfidf_lr"]`の`max_iter`や`tol`を調整できます。
@@ -268,6 +274,8 @@ outputs/
 ├── experiment_summary.csv
 ├── ensemble_weights.csv
 ├── ensemble_history.csv
+├── ensemble_fold_scores.csv
+├── ensemble_summary.csv
 ├── ensemble_oof.parquet
 ├── submission.csv
 └── test_predictions/
@@ -275,7 +283,13 @@ outputs/
 
 ## ROC-AUC hill climbing ensembleとsubmission
 
-評価指標はROC-AUCです。`ensemble.py`は、各候補が完全に同じOOF行を持つことを確認したうえで、pooled OOF ROC-AUCを最大化する混合モデルと係数を貪欲探索します。validationにならなかった古い年度など、全モデル共通でOOFが`NaN`の行は探索から除外され、ensemble OOFでも`NaN`のままです。
+評価指標はROC-AUCです。`ensemble.py`は各候補が完全に同じOOF行を持つことを確認し、次の目的関数を選択できます。
+
+- `pooled_auc`: 全validation年度を連結したAUC
+- `mean_fold_auc`: 各fold AUCの単純平均
+- `weighted_fold_auc`: 指定重みによる各fold AUCの加重平均
+
+`blend_mode="rank"`では、各モデルのOOFをfold内でpercentile rank化してから混合します。testは各モデルについてtest全体でrank化し、学習済み重みを適用します。`probability`も同じNotebookで比較できます。validationにならなかった古い年度など、全モデル共通でOOFが`NaN`の行は探索から除外され、ensemble OOFでも`NaN`のままです。
 
 ```python
 from ensemble import hill_climb_auc
@@ -283,13 +297,20 @@ from ensemble import hill_climb_auc
 ensemble_result = hill_climb_auc(
     suite.oof_predictions,
     train[TARGET_COL],
+    folds=folds,
+    objective="weighted_fold_auc",
+    fold_weights=[0.2, 0.3, 0.5],  # 古いfold → 最新fold
+    blend_mode="rank",
     max_steps=50,
 )
 
 display(ensemble_result.individual_scores.to_frame())
 display(ensemble_result.weights[ensemble_result.weights > 0].to_frame())
-print("ensemble OOF AUC:", ensemble_result.score)
+print("weighted fold AUC:", ensemble_result.score)
+print("pooled OOF AUC:", ensemble_result.pooled_auc)
 ```
+
+Notebook 04は3目的関数×2 blend modeの6通りを同じ表へ出します。OOF上の最高値を自動採用すると選択バイアスが増えるため、既定では`SELECTED_ENSEMBLE="weighted_rank"`を明示し、比較表を見て人が変更する設計です。重みの個数が実際のfold数と違う場合はエラーにします。
 
 Notebook 04の最終セルは、正のensemble weightを持つモデルだけを全trainで再fitし、test予測を同じ重みで合成します。`ID_COL`の値と行順をtestからそのまま保持し、`outputs/submission.csv`を次の2列で作成します。
 

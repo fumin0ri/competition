@@ -8,7 +8,10 @@ import numpy as np
 import pandas as pd
 
 from modeling import (
+    _mlp_monitor_improved,
+    _mlp_validation_statistics,
     build_experiment_summary,
+    default_modeling_config,
     fit_full_and_predict_test,
     prepare_tabular_features,
     run_all_experiments,
@@ -151,12 +154,45 @@ class ModelingTests(unittest.TestCase):
         self.assertEqual(summary.loc["x", "latest"], 0.8)
         self.assertAlmostEqual(summary.loc["x", "mean"], 0.7)
 
+    def test_auc_is_default_for_tree_and_mlp_early_stopping(self):
+        config = default_modeling_config()
+        self.assertEqual(config["catboost"]["loss_function"], "Logloss")
+        self.assertEqual(config["catboost"]["eval_metric"], "AUC")
+        self.assertEqual(config["xgboost"]["objective"], "binary:logistic")
+        self.assertEqual(config["xgboost"]["eval_metric"], "auc")
+        self.assertEqual(config["mlp"]["early_stop_metric"], "auc")
+
+    def test_mlp_auc_monitor_maximizes_auc_while_loss_monitor_minimizes_loss(self):
+        monitor, auc = _mlp_validation_statistics(
+            np.array([0, 1]),
+            np.array([0.2, 0.8]),
+            0.7,
+            "auc",
+        )
+        self.assertEqual(monitor, 1.0)
+        self.assertEqual(auc, 1.0)
+        self.assertTrue(_mlp_monitor_improved(0.8, 0.7, "auc", 1e-6))
+        self.assertFalse(_mlp_monitor_improved(0.6, 0.7, "auc", 1e-6))
+        self.assertTrue(_mlp_monitor_improved(0.6, 0.7, "loss", 1e-6))
+        self.assertFalse(_mlp_monitor_improved(0.8, 0.7, "loss", 1e-6))
+
+    def test_mlp_auc_monitor_rejects_one_class_validation(self):
+        with self.assertRaisesRegex(ValueError, "both target classes"):
+            _mlp_validation_statistics(
+                np.array([1, 1]),
+                np.array([0.2, 0.8]),
+                0.7,
+                "auc",
+            )
+
     def test_e5_catboost_uses_native_categorical_features(self):
         fit_cat_features = []
+        model_params = []
 
         class FakeCatBoostClassifier:
             def __init__(self, **params):
                 self.params = params
+                model_params.append(params)
 
             def fit(self, x, y, cat_features, eval_set, use_best_model):
                 del eval_set, use_best_model
@@ -189,11 +225,16 @@ class ModelingTests(unittest.TestCase):
             [["responsible_ministry"]] * 3,
         )
         self.assertTrue(result.oof.notna().sum() > 0)
+        self.assertTrue(all(params["eval_metric"] == "AUC" for params in model_params))
+        self.assertTrue(all(params["loss_function"] == "Logloss" for params in model_params))
 
     def test_e6_optional_pca_runs_inside_each_fold(self):
+        model_params = []
+
         class FakeXGBClassifier:
             def __init__(self, **params):
                 self.params = params
+                model_params.append(params)
                 self.best_iteration = 4
 
             def fit(self, x, y, eval_set, verbose):
@@ -224,6 +265,8 @@ class ModelingTests(unittest.TestCase):
             result.fold_metrics["pca_explained_variance"].between(0, 1).all()
         )
         self.assertTrue((result.fold_metrics["input_dim"] > 2).all())
+        self.assertTrue(all(params["eval_metric"] == "auc" for params in model_params))
+        self.assertTrue(all(params["objective"] == "binary:logistic" for params in model_params))
 
     def test_t1_t2_t3_share_one_tfidf_fit_per_fold_and_stay_sparse(self):
         from text_features import fit_transform_tfidf_columns

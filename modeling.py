@@ -101,6 +101,8 @@ def default_modeling_config() -> dict[str, Any]:
             "max_epochs": 60,
             "full_epochs": 30,
             "patience": 8,
+            "early_stop_metric": "auc",
+            "early_stopping_min_delta": 1e-6,
             "learning_rate": 1e-3,
             "weight_decay": 1e-5,
             "device": "cuda",
@@ -112,7 +114,7 @@ def default_modeling_config() -> dict[str, Any]:
             "learning_rate": 0.05,
             "depth": 6,
             "loss_function": "Logloss",
-            "eval_metric": "Logloss",
+            "eval_metric": "AUC",
             "early_stopping_rounds": 80,
             "task_type": "GPU",
             "devices": "0",
@@ -126,7 +128,7 @@ def default_modeling_config() -> dict[str, Any]:
             "subsample": 0.8,
             "colsample_bytree": 0.8,
             "objective": "binary:logistic",
-            "eval_metric": "logloss",
+            "eval_metric": "auc",
             "early_stopping_rounds": 80,
             "tree_method": "hist",
             "device": "cuda",
@@ -719,6 +721,52 @@ def _resolve_torch_device(requested: str, allow_cpu_fallback: bool) -> Any:
     return torch.device(requested)
 
 
+def _mlp_validation_statistics(
+    y_valid: np.ndarray,
+    prediction: np.ndarray,
+    mean_valid_loss: float,
+    early_stop_metric: str,
+) -> tuple[float, float]:
+    """Return the monitored value and validation AUC without depending on Torch."""
+    metric = early_stop_metric.lower()
+    if metric not in {"auc", "loss"}:
+        raise ValueError("mlp.early_stop_metric must be 'auc' or 'loss'.")
+    target = np.asarray(y_valid).reshape(-1)
+    probability = np.asarray(prediction, dtype=float).reshape(-1)
+    if len(target) != len(probability) or not np.isfinite(probability).all():
+        raise ValueError("MLP validation predictions are invalid.")
+    if not math.isfinite(mean_valid_loss):
+        raise ValueError("MLP validation loss is not finite.")
+    validation_auc = (
+        float(roc_auc_score(target, probability))
+        if np.unique(target).size >= 2
+        else float("nan")
+    )
+    if metric == "auc":
+        if math.isnan(validation_auc):
+            raise ValueError(
+                "MLP AUC early stopping requires both target classes in validation."
+            )
+        return validation_auc, validation_auc
+    return float(mean_valid_loss), validation_auc
+
+
+def _mlp_monitor_improved(
+    current: float,
+    best: float,
+    early_stop_metric: str,
+    min_delta: float,
+) -> bool:
+    """Compare an MLP early-stopping value in the correct optimization direction."""
+    if min_delta < 0:
+        raise ValueError("mlp.early_stopping_min_delta must be non-negative.")
+    if early_stop_metric == "auc":
+        return current > best + min_delta
+    if early_stop_metric == "loss":
+        return current < best - min_delta
+    raise ValueError("mlp.early_stop_metric must be 'auc' or 'loss'.")
+
+
 def _fit_predict_torch_mlp(
     x_train: np.ndarray,
     y_train: np.ndarray,
@@ -727,7 +775,7 @@ def _fit_predict_torch_mlp(
     config: Mapping[str, Any],
     random_state: int,
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """Fit a compact binary MLP with validation-loss early stopping."""
+    """Fit a compact binary MLP with configurable AUC/loss early stopping."""
     try:
         import torch
         from torch import nn
@@ -778,8 +826,14 @@ def _fit_predict_torch_mlp(
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     max_epochs = int(config.get("max_epochs", 60))
     patience = int(config.get("patience", 8))
+    early_stop_metric = str(config.get("early_stop_metric", "auc")).lower()
+    min_delta = float(config.get("early_stopping_min_delta", 1e-6))
     if max_epochs <= 0 or patience < 0:
         raise ValueError("mlp.max_epochs must be positive and patience non-negative.")
+    if early_stop_metric not in {"auc", "loss"}:
+        raise ValueError("mlp.early_stop_metric must be 'auc' or 'loss'.")
+    if min_delta < 0:
+        raise ValueError("mlp.early_stopping_min_delta must be non-negative.")
 
     valid_loader = None
     if y_valid is not None:
@@ -796,7 +850,9 @@ def _fit_predict_torch_mlp(
         )
 
     best_state: dict[str, Any] | None = None
-    best_loss = math.inf
+    best_monitor = -math.inf if early_stop_metric == "auc" else math.inf
+    best_validation_loss = float("nan")
+    best_validation_auc = float("nan")
     best_epoch = 0
     stale_epochs = 0
     started = time.perf_counter()
@@ -820,18 +876,37 @@ def _fit_predict_torch_mlp(
         model.eval()
         valid_loss_sum = 0.0
         valid_rows = 0
+        valid_predictions: list[np.ndarray] = []
         assert valid_loader is not None
         with torch.no_grad():
             for batch_x, batch_y in valid_loader:
                 batch_x = batch_x.to(device, non_blocking=pin_memory)
                 batch_y = batch_y.to(device, non_blocking=pin_memory)
                 with torch.autocast(device_type=device.type, enabled=amp_enabled):
-                    loss = criterion(model(batch_x), batch_y)
+                    logits = model(batch_x)
+                    loss = criterion(logits, batch_y)
                 valid_loss_sum += float(loss.detach().cpu()) * len(batch_x)
                 valid_rows += len(batch_x)
+                valid_predictions.append(
+                    torch.sigmoid(logits).float().cpu().numpy().reshape(-1)
+                )
         mean_valid_loss = valid_loss_sum / valid_rows
-        if mean_valid_loss < best_loss - 1e-6:
-            best_loss = mean_valid_loss
+        valid_probability = np.concatenate(valid_predictions)
+        monitor, validation_auc = _mlp_validation_statistics(
+            np.asarray(y_valid),
+            valid_probability,
+            mean_valid_loss,
+            early_stop_metric,
+        )
+        if _mlp_monitor_improved(
+            monitor,
+            best_monitor,
+            early_stop_metric,
+            min_delta,
+        ):
+            best_monitor = monitor
+            best_validation_loss = mean_valid_loss
+            best_validation_auc = validation_auc
             best_epoch = epoch
             best_state = {
                 key: value.detach().cpu().clone()
@@ -870,7 +945,9 @@ def _fit_predict_torch_mlp(
         "input_dim": x_train.shape[1],
         "device": str(device),
         "best_iteration": best_epoch,
-        "best_validation_loss": best_loss if y_valid is not None else np.nan,
+        "early_stop_metric": early_stop_metric if y_valid is not None else "none",
+        "best_validation_loss": best_validation_loss,
+        "best_validation_auc": best_validation_auc,
         "pca_explained_variance": np.nan,
     }
     if device.type == "cuda":
@@ -1040,7 +1117,7 @@ def run_e5_tabular_catboost(
     params.setdefault("learning_rate", 0.05)
     params.setdefault("depth", 6)
     params.setdefault("loss_function", "Logloss")
-    params.setdefault("eval_metric", "Logloss")
+    params.setdefault("eval_metric", "AUC")
     params.setdefault("early_stopping_rounds", 80)
     params.setdefault("verbose", False)
     params.setdefault("allow_writing_files", False)
@@ -1162,7 +1239,7 @@ def run_e6_embedding_tabular_xgboost(
     params.setdefault("subsample", 0.8)
     params.setdefault("colsample_bytree", 0.8)
     params.setdefault("objective", "binary:logistic")
-    params.setdefault("eval_metric", "logloss")
+    params.setdefault("eval_metric", "auc")
     params.setdefault("early_stopping_rounds", 80)
     params.setdefault("tree_method", "hist")
     params.setdefault("device", "cpu")
