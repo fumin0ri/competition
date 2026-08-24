@@ -19,10 +19,12 @@ competition/
 │   ├── test_validation.py
 │   ├── test_text_features.py
 │   ├── test_embedding_features.py
-│   └── test_modeling.py
+│   ├── test_modeling.py
+│   └── test_ensemble.py
 ├── requirements.txt
 ├── embedding_features.py      # 外部Embedding API・resume・保存
-├── modeling.py                # Embedding + tabularの6モデル比較
+├── ensemble.py                # AUC hill climbing・test blend・submission
+├── modeling.py                # E1〜E6 / T1〜T3の統一比較
 ├── text_features.py           # char TF-IDF・Logistic Regression
 ├── validation.py              # CV・seen/unseen判定
 └── README.md
@@ -226,7 +228,7 @@ E1/E2のLRは、denseなEmbeddingと中規模の特徴数に対する堅実なba
 
 T1〜T3のLRは、行数より特徴数が多い高次元疎行列を想定して`liblinear, dual=True`を既定にしています。収束警告が出る場合は`CONFIG["tfidf_lr"]`の`max_iter`や`tol`を調整できます。
 
-実行は`notebooks/04_embedding_models.ipynb`から行います。Notebookは初期状態で`RUN_CV=False`、`run_final_test_prediction=False`のため、明示的に有効化するまで重い学習やtest予測を開始しません。
+実行は`notebooks/04_embedding_models.ipynb`から行います。Notebookは初期状態で`RUN_CV=False`、`RUN_ENSEMBLE=False`、`RUN_FINAL_SUBMISSION=False`のため、明示的に有効化するまで重い学習やtest予測を開始しません。
 
 TF-IDF設定と生成特徴量の保存先もconfigから変更できます。
 
@@ -246,8 +248,38 @@ outputs/
 ├── fold_metrics.parquet
 ├── experiment_summary.parquet
 ├── experiment_summary.csv
+├── ensemble_weights.csv
+├── ensemble_history.csv
+├── ensemble_oof.parquet
+├── submission.csv
 └── test_predictions/
 ```
+
+## ROC-AUC hill climbing ensembleとsubmission
+
+評価指標はROC-AUCです。`ensemble.py`は、各候補が完全に同じOOF行を持つことを確認したうえで、pooled OOF ROC-AUCを最大化する混合モデルと係数を貪欲探索します。validationにならなかった古い年度など、全モデル共通でOOFが`NaN`の行は探索から除外され、ensemble OOFでも`NaN`のままです。
+
+```python
+from ensemble import hill_climb_auc
+
+ensemble_result = hill_climb_auc(
+    suite.oof_predictions,
+    train[TARGET_COL],
+    max_steps=50,
+)
+
+display(ensemble_result.individual_scores.to_frame())
+display(ensemble_result.weights[ensemble_result.weights > 0].to_frame())
+print("ensemble OOF AUC:", ensemble_result.score)
+```
+
+Notebook 04の最終セルは、正のensemble weightを持つモデルだけを全trainで再fitし、test予測を同じ重みで合成します。`ID_COL`の値と行順をtestからそのまま保持し、`outputs/submission.csv`を次の2列で作成します。
+
+```text
+<ID_COL>,target
+```
+
+提出前にはNotebookが、IDの欠損・重複、予測件数、不正な確率、CSV再読込後の列と行順を検査します。hill climbingはOOFへの追加最適化なので、単体モデルより過学習しやすい点には注意し、各fold AUCや最新foldの傾向も併せて判断してください。
 
 PCAなしが既定です。比較するときだけ変更します。
 
