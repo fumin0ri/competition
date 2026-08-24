@@ -1,4 +1,4 @@
-"""Expanding-window cross-validation for project-level time series data."""
+"""Reusable validation utilities for project-level competition data."""
 
 from __future__ import annotations
 

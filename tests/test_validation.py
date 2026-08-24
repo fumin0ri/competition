@@ -3,7 +3,7 @@ import warnings
 
 import pandas as pd
 
-from time_series_cv import make_seen_project_mask, make_time_series_cv
+from validation import make_seen_project_mask, make_time_series_cv
 
 
 class TimeSeriesCVTest(unittest.TestCase):

@@ -1,2 +1,7 @@
 __pycache__/
 *.py[cod]
+.ipynb_checkpoints/
+
+# Competition data must not be committed.
+input/*
+!input/.gitkeep
