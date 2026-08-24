@@ -15,6 +15,7 @@ from modeling import (
     run_e1_embedding_lr,
     run_e5_tabular_catboost,
     run_e6_embedding_tabular_xgboost,
+    run_tfidf_lr_experiments,
     validate_embedding_input,
 )
 from validation import make_time_series_cv
@@ -118,6 +119,9 @@ class ModelingTests(unittest.TestCase):
                     "run_e4": False,
                     "run_e5": False,
                     "run_e6": False,
+                    "run_t1": False,
+                    "run_t2": False,
+                    "run_t3": False,
                     "output_dir": directory,
                 },
             )
@@ -220,6 +224,190 @@ class ModelingTests(unittest.TestCase):
             result.fold_metrics["pca_explained_variance"].between(0, 1).all()
         )
         self.assertTrue((result.fold_metrics["input_dim"] > 2).all())
+
+    def test_t1_t2_t3_share_one_tfidf_fit_per_fold_and_stay_sparse(self):
+        from text_features import fit_transform_tfidf_columns
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch(
+                "modeling.fit_transform_tfidf_columns",
+                wraps=fit_transform_tfidf_columns,
+            ) as transform:
+                results = run_tfidf_lr_experiments(
+                    df=self.train,
+                    folds=self.folds,
+                    text_cols=["project_name"],
+                    numeric_cols=["project_start_year", "budget"],
+                    categorical_cols=["responsible_ministry"],
+                    embeddings=self.embeddings,
+                    embedding_metadata=self.metadata,
+                    tfidf_config={
+                        "ngram_range": (2, 3),
+                        "min_df": 1,
+                        "max_features": 1_000,
+                    },
+                    tfidf_lr_config={"dual": False, "tol": 1e-2},
+                    tfidf_feature_output_dir=directory,
+                )
+            self.assertEqual(transform.call_count, len(self.folds))
+            self.assertEqual(
+                list(results),
+                [
+                    "T1_tfidf_lr",
+                    "T2_tfidf_tabular_lr",
+                    "T3_tfidf_embedding_tabular_lr",
+                ],
+            )
+            validation_labels = pd.Index(
+                np.concatenate([valid_idx.to_numpy() for _, valid_idx in self.folds])
+            )
+            old_labels = self.train.index.difference(validation_labels)
+            for result in results.values():
+                self.assertTrue(result.oof.loc[old_labels].isna().all())
+                self.assertTrue(result.oof.loc[validation_labels].notna().all())
+                self.assertEqual(result.fold_metrics["validation_year"].tolist(), [2020, 2021, 2022])
+                self.assertTrue(result.metadata["features_are_sparse"])
+                self.assertTrue((result.fold_metrics["sparse_memory_mib"] > 0).all())
+            self.assertTrue(
+                (Path(directory) / "fold_0_year_2020" / "train_features.csv.gz").exists()
+            )
+            self.assertTrue(results["T1_tfidf_lr"].fold_metrics["seen_score"].isna().all())
+
+    def test_t3_rejects_embedding_metadata_misalignment(self):
+        reordered = self.metadata.iloc[::-1].reset_index(drop=True)
+        with self.assertRaisesRegex(ValueError, "project_id order mismatch"):
+            run_tfidf_lr_experiments(
+                df=self.train,
+                folds=self.folds,
+                text_cols=["project_name"],
+                numeric_cols=["project_start_year", "budget"],
+                categorical_cols=["responsible_ministry"],
+                embeddings=self.embeddings,
+                embedding_metadata=reordered,
+                run_t1=False,
+                run_t2=False,
+                run_t3=True,
+                tfidf_feature_output_dir=None,
+            )
+
+    def test_run_all_adds_t1_t2_t3_to_unified_oof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            suite = run_all_experiments(
+                train=self.train,
+                folds=self.folds,
+                train_embeddings=self.embeddings,
+                train_embedding_metadata=self.metadata,
+                numeric_cols=["project_start_year", "budget"],
+                categorical_cols=["responsible_ministry"],
+                config={
+                    "run_e1": False,
+                    "run_e2": False,
+                    "run_e3": False,
+                    "run_e4": False,
+                    "run_e5": False,
+                    "run_e6": False,
+                    "text_cols": ["project_name"],
+                    "tfidf": {
+                        "ngram_range": (2, 3),
+                        "min_df": 1,
+                        "max_features": 1_000,
+                    },
+                    "tfidf_feature_output_dir": None,
+                    "tfidf_lr": {"dual": False, "tol": 1e-2},
+                    "output_dir": directory,
+                },
+            )
+        self.assertEqual(
+            suite.oof_predictions.columns.tolist(),
+            [
+                "T1_tfidf_lr",
+                "T2_tfidf_tabular_lr",
+                "T3_tfidf_embedding_tabular_lr",
+            ],
+        )
+        self.assertEqual(len(suite.fold_metrics), 9)
+
+    def test_final_t3_fits_full_train_and_predicts_unknown_test_category(self):
+        test = self.train.iloc[:3].drop(columns="target").copy()
+        test.index = [900, 901, 902]
+        test["project_id"] = ["t1", "t2", "t3"]
+        test["project_name"] = ["テスト限定語A", "テスト限定語B", "テスト限定語C"]
+        test["responsible_ministry"] = "UNKNOWN_MINISTRY"
+        test_embeddings = self.embeddings[:3]
+        test_metadata = pd.DataFrame(
+            {
+                "split": "test",
+                "original_index": test.index,
+                "project_id": test["project_id"].to_numpy(),
+            }
+        )
+        prediction = fit_full_and_predict_test(
+            experiment="T3_tfidf_embedding_tabular_lr",
+            train=self.train,
+            test=test,
+            train_embeddings=self.embeddings,
+            test_embeddings=test_embeddings,
+            train_embedding_metadata=self.metadata,
+            test_embedding_metadata=test_metadata,
+            numeric_cols=["project_start_year", "budget"],
+            categorical_cols=["responsible_ministry"],
+            config={
+                "text_cols": ["project_name"],
+                "tfidf": {
+                    "ngram_range": (2, 3),
+                    "min_df": 1,
+                    "max_features": 1_000,
+                },
+                "tfidf_lr": {"dual": False, "tol": 1e-2},
+            },
+        )
+        self.assertEqual(prediction.shape, (3,))
+        self.assertTrue(((prediction >= 0) & (prediction <= 1)).all())
+
+    def test_final_t1_t2_do_not_require_embeddings(self):
+        test = self.train.iloc[:3].drop(columns="target").copy()
+        test.index = [900, 901, 902]
+        test["project_id"] = ["t1", "t2", "t3"]
+        test["responsible_ministry"] = "UNKNOWN_MINISTRY"
+        config = {
+            "text_cols": ["project_name"],
+            "tfidf": {
+                "ngram_range": (2, 3),
+                "min_df": 1,
+                "max_features": 1_000,
+            },
+            "tfidf_lr": {"dual": False, "tol": 1e-2},
+        }
+        for experiment in ("T1_tfidf_lr", "T2_tfidf_tabular_lr"):
+            with self.subTest(experiment=experiment):
+                prediction = fit_full_and_predict_test(
+                    experiment=experiment,
+                    train=self.train,
+                    test=test,
+                    train_embeddings=None,
+                    test_embeddings=None,
+                    train_embedding_metadata=None,
+                    test_embedding_metadata=None,
+                    numeric_cols=["project_start_year", "budget"],
+                    categorical_cols=["responsible_ministry"],
+                    config=config,
+                )
+                self.assertEqual(prediction.shape, (3,))
+                self.assertTrue(((prediction >= 0) & (prediction <= 1)).all())
+
+    def test_tfidf_experiments_forbid_target_as_text(self):
+        with self.assertRaisesRegex(ValueError, "target_col"):
+            run_tfidf_lr_experiments(
+                df=self.train,
+                folds=self.folds,
+                text_cols=["project_name", "target"],
+                numeric_cols=[],
+                categorical_cols=[],
+                run_t1=True,
+                run_t2=False,
+                run_t3=False,
+                tfidf_feature_output_dir=None,
+            )
 
     def test_final_e1_does_not_require_tabular_columns(self):
         train = self.train[["project_id", "project_name", "target"]].copy()

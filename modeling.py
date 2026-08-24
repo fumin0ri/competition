@@ -1,4 +1,4 @@
-"""Leakage-safe CV baselines for saved embeddings and tabular features."""
+"""Leakage-safe CV baselines for embeddings, tabular, and TF-IDF features."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy import sparse
 from sklearn.compose import ColumnTransformer
 from sklearn.decomposition import PCA
 from sklearn.impute import SimpleImputer
@@ -23,6 +24,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler, normalize
 
 from embedding_features import verify_embedding_alignment
+from text_features import fit_transform_tfidf_columns, save_sparse_features_csv
 from validation import make_seen_project_mask
 
 
@@ -60,10 +62,33 @@ def default_modeling_config() -> dict[str, Any]:
         "run_e4": True,
         "run_e5": True,
         "run_e6": True,
+        "run_t1": True,
+        "run_t2": True,
+        "run_t3": True,
         "e6_pca_dims": [None],
         "metric": "roc_auc",
         "random_state": 42,
         "embedding_scaling": "l2",
+        "text_cols": [
+            "project_name",
+            "project_objective",
+            "project_summary",
+        ],
+        "tfidf": {
+            "analyzer": "char",
+            "ngram_range": (2, 5),
+            "min_df": 2,
+            "max_features": 300_000,
+            "sublinear_tf": True,
+            "dtype": np.float32,
+        },
+        "tfidf_lr": {
+            "C": 1.0,
+            "max_iter": 3000,
+            "solver": "liblinear",
+            "dual": True,
+        },
+        "tfidf_feature_output_dir": "data/csv/tfidf_shared",
         "lr": {
             "C": 1.0,
             "max_iter": 3000,
@@ -316,6 +341,84 @@ def _make_tabular_preprocessor(
         sparse_threshold=0.0,
         verbose_feature_names_out=False,
     )
+
+
+def _make_sparse_tabular_preprocessor(
+    numeric_cols: Sequence[str],
+    categorical_cols: Sequence[str],
+) -> ColumnTransformer:
+    """Build fold-fitted tabular preprocessing that preserves sparse output."""
+    transformers: list[tuple[str, Any, Sequence[str]]] = []
+    if numeric_cols:
+        transformers.append(
+            (
+                "numeric",
+                Pipeline(
+                    [
+                        ("imputer", SimpleImputer(strategy="median")),
+                        ("scaler", StandardScaler(with_mean=False)),
+                    ]
+                ),
+                list(numeric_cols),
+            )
+        )
+    if categorical_cols:
+        transformers.append(
+            (
+                "categorical",
+                Pipeline(
+                    [
+                        (
+                            "imputer",
+                            SimpleImputer(
+                                strategy="constant",
+                                fill_value="__MISSING__",
+                            ),
+                        ),
+                        (
+                            "onehot",
+                            OneHotEncoder(
+                                handle_unknown="ignore",
+                                sparse_output=True,
+                                dtype=np.float32,
+                            ),
+                        ),
+                    ]
+                ),
+                list(categorical_cols),
+            )
+        )
+    if not transformers:
+        raise ValueError("At least one numeric or categorical column is required.")
+    return ColumnTransformer(
+        transformers=transformers,
+        remainder="drop",
+        sparse_threshold=1.0,
+        verbose_feature_names_out=False,
+    )
+
+
+def _as_float32_csr(matrix: Any) -> sparse.csr_matrix:
+    result = sparse.csr_matrix(matrix, dtype=np.float32)
+    if result.ndim != 2 or not np.isfinite(result.data).all():
+        raise ValueError("Sparse feature matrix is invalid or non-finite.")
+    return result
+
+
+def _sparse_hstack(*matrices: Any) -> sparse.csr_matrix:
+    result = sparse.hstack(
+        [_as_float32_csr(matrix) for matrix in matrices],
+        format="csr",
+        dtype=np.float32,
+    )
+    if not sparse.isspmatrix_csr(result):
+        raise AssertionError("Combined features must remain CSR sparse.")
+    return result
+
+
+def _csr_memory_mib(matrix: sparse.csr_matrix) -> float:
+    total_bytes = matrix.data.nbytes + matrix.indices.nbytes + matrix.indptr.nbytes
+    return float(total_bytes / 1024**2)
 
 
 def _fit_transform_embeddings(
@@ -1123,6 +1226,283 @@ def run_e6_embedding_tabular_xgboost(
     )
 
 
+def _tfidf_lr_from_config(
+    config: Mapping[str, Any],
+    random_state: int,
+) -> LogisticRegression:
+    params = {
+        "C": 1.0,
+        "max_iter": 3000,
+        "solver": "liblinear",
+        "dual": True,
+        **dict(config),
+    }
+    params["random_state"] = random_state
+    return LogisticRegression(**params)
+
+
+def run_tfidf_lr_experiments(
+    df: pd.DataFrame,
+    folds: Sequence[tuple[pd.Index, pd.Index]],
+    text_cols: Sequence[str],
+    numeric_cols: Sequence[str],
+    categorical_cols: Sequence[str],
+    *,
+    embeddings: np.ndarray | None = None,
+    embedding_metadata: pd.DataFrame | None = None,
+    run_t1: bool = True,
+    run_t2: bool = True,
+    run_t3: bool = True,
+    target_col: str = "target",
+    project_col: str = "project_name",
+    project_id_col: str = "project_id",
+    year_col: str = "project_start_year",
+    metric: str = "roc_auc",
+    embedding_scaling: str = "l2",
+    tfidf_config: Mapping[str, Any] | None = None,
+    tfidf_lr_config: Mapping[str, Any] | None = None,
+    feature_config: Mapping[str, Any] | None = None,
+    tfidf_feature_output_dir: str | Path | None = "data/csv/tfidf_shared",
+    random_state: int = 42,
+) -> dict[str, ExperimentResult]:
+    """Run T1-T3 while fitting each fold's TF-IDF vectorizers only once."""
+    enabled = {
+        "T1_tfidf_lr": bool(run_t1),
+        "T2_tfidf_tabular_lr": bool(run_t2),
+        "T3_tfidf_embedding_tabular_lr": bool(run_t3),
+    }
+    enabled_names = [name for name, should_run in enabled.items() if should_run]
+    if not enabled_names:
+        return {}
+    if not text_cols or len(set(text_cols)) != len(text_cols):
+        raise ValueError("text_cols must be non-empty and contain no duplicates.")
+    if target_col in text_cols:
+        raise ValueError("target_col must never be included in TF-IDF text_cols.")
+    missing = [
+        column
+        for column in [*text_cols, target_col, project_col, year_col]
+        if column not in df.columns
+    ]
+    if missing:
+        raise KeyError(f"Missing TF-IDF experiment columns: {missing}")
+    metric = _validate_metric(metric)
+    _validate_binary_target(df[target_col], target_col)
+    set_global_seed(random_state)
+
+    embedding_matrix: np.ndarray | None = None
+    if run_t3:
+        if embeddings is None or embedding_metadata is None:
+            raise ValueError("T3 requires embeddings and embedding_metadata.")
+        embedding_matrix = validate_embedding_input(
+            df,
+            embeddings,
+            embedding_metadata,
+            project_id_col,
+            split="train",
+        )
+
+    table: pd.DataFrame | None = None
+    numeric: list[str] = []
+    categorical: list[str] = []
+    if run_t2 or run_t3:
+        table, numeric, categorical = prepare_tabular_features(
+            df,
+            numeric_cols,
+            categorical_cols,
+            **dict(feature_config or {}),
+        )
+
+    oof = {
+        name: pd.Series(np.nan, index=df.index, dtype=float, name=name)
+        for name in enabled_names
+    }
+    fold_records: dict[str, list[dict[str, Any]]] = {
+        name: [] for name in enabled_names
+    }
+    output_root = (
+        Path(tfidf_feature_output_dir)
+        if tfidf_feature_output_dir is not None
+        else None
+    )
+
+    for fold_number, (train_idx, valid_idx) in enumerate(folds):
+        train_idx = pd.Index(train_idx)
+        valid_idx = pd.Index(valid_idx)
+        train_positions = _positions_from_labels(df, train_idx)
+        valid_positions = _positions_from_labels(df, valid_idx)
+        if np.intersect1d(train_positions, valid_positions).size:
+            raise ValueError("Training and validation indices overlap.")
+        y_train = df.loc[train_idx, target_col].to_numpy(dtype=np.float32)
+        y_valid = df.loc[valid_idx, target_col].to_numpy(dtype=np.float32)
+        if np.unique(y_train).size < 2:
+            raise ValueError(f"Fold {fold_number} training target has only one class.")
+
+        started = time.perf_counter()
+        tfidf_train, tfidf_valid, _, feature_names = fit_transform_tfidf_columns(
+            train_df=df.loc[train_idx],
+            transform_df=df.loc[valid_idx],
+            text_cols=text_cols,
+            tfidf_params=tfidf_config,
+        )
+        tfidf_train = _as_float32_csr(tfidf_train)
+        tfidf_valid = _as_float32_csr(tfidf_valid)
+        tfidf_seconds = time.perf_counter() - started
+
+        tab_train: sparse.csr_matrix | None = None
+        tab_valid: sparse.csr_matrix | None = None
+        tabular_seconds = 0.0
+        if run_t2 or run_t3:
+            assert table is not None
+            started = time.perf_counter()
+            preprocessor = _make_sparse_tabular_preprocessor(numeric, categorical)
+            tab_train = _as_float32_csr(
+                preprocessor.fit_transform(table.loc[train_idx])
+            )
+            tab_valid = _as_float32_csr(
+                preprocessor.transform(table.loc[valid_idx])
+            )
+            tabular_seconds = time.perf_counter() - started
+
+        emb_train: sparse.csr_matrix | None = None
+        emb_valid: sparse.csr_matrix | None = None
+        embedding_seconds = 0.0
+        if run_t3:
+            assert embedding_matrix is not None
+            started = time.perf_counter()
+            dense_train, dense_valid, _ = _fit_transform_embeddings(
+                embedding_matrix[train_positions],
+                embedding_matrix[valid_positions],
+                embedding_scaling,
+            )
+            emb_train = _as_float32_csr(dense_train)
+            emb_valid = _as_float32_csr(dense_valid)
+            embedding_seconds = time.perf_counter() - started
+
+        fold_features: dict[str, tuple[sparse.csr_matrix, sparse.csr_matrix, float]] = {}
+        if run_t1:
+            fold_features["T1_tfidf_lr"] = (
+                tfidf_train,
+                tfidf_valid,
+                tfidf_seconds,
+            )
+        if run_t2:
+            assert tab_train is not None and tab_valid is not None
+            fold_features["T2_tfidf_tabular_lr"] = (
+                _sparse_hstack(tfidf_train, tab_train),
+                _sparse_hstack(tfidf_valid, tab_valid),
+                tfidf_seconds + tabular_seconds,
+            )
+        if run_t3:
+            assert tab_train is not None and tab_valid is not None
+            assert emb_train is not None and emb_valid is not None
+            fold_features["T3_tfidf_embedding_tabular_lr"] = (
+                _sparse_hstack(tfidf_train, emb_train, tab_train),
+                _sparse_hstack(tfidf_valid, emb_valid, tab_valid),
+                tfidf_seconds + tabular_seconds + embedding_seconds,
+            )
+
+        seen = make_seen_project_mask(
+            df=df,
+            train_idx=train_idx,
+            valid_idx=valid_idx,
+            project_col=project_col,
+        ).to_numpy(dtype=bool)
+        validation_year = _fold_year(df, valid_idx, year_col)
+
+        for experiment, (x_train, x_valid, preprocessing_seconds) in fold_features.items():
+            if not sparse.isspmatrix_csr(x_train) or not sparse.isspmatrix_csr(x_valid):
+                raise AssertionError("T1-T3 features must remain CSR sparse.")
+            model = _tfidf_lr_from_config(tfidf_lr_config or {}, random_state)
+            started = time.perf_counter()
+            model.fit(x_train, y_train)
+            model_fit_seconds = time.perf_counter() - started
+            started = time.perf_counter()
+            prediction = np.asarray(model.predict_proba(x_valid)[:, 1], dtype=float)
+            predict_seconds = time.perf_counter() - started
+            if len(prediction) != len(valid_idx) or not np.isfinite(prediction).all():
+                raise ValueError("TF-IDF validation predictions are invalid.")
+            oof[experiment].loc[valid_idx] = prediction
+            memory_mib = _csr_memory_mib(x_train)
+            if (
+                experiment == "T3_tfidf_embedding_tabular_lr"
+                and memory_mib >= 1024
+            ):
+                warnings.warn(
+                    f"T3 fold {fold_number} CSR matrix uses {memory_mib:.1f} MiB.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            fold_records[experiment].append(
+                {
+                    "experiment": experiment,
+                    "fold": fold_number,
+                    "validation_year": validation_year,
+                    "train_rows": len(train_idx),
+                    "valid_rows": len(valid_idx),
+                    "metric": metric,
+                    "overall_score": _safe_score(y_valid, prediction, metric),
+                    "seen_score": _safe_score(
+                        y_valid[seen], prediction[seen], metric
+                    ),
+                    "unseen_score": _safe_score(
+                        y_valid[~seen], prediction[~seen], metric
+                    ),
+                    "seen_ratio": float(seen.mean()) if len(seen) else float("nan"),
+                    "seen_rows": int(seen.sum()),
+                    "unseen_rows": int((~seen).sum()),
+                    "fit_seconds": preprocessing_seconds + model_fit_seconds,
+                    "predict_seconds": predict_seconds,
+                    "shared_tfidf_seconds": tfidf_seconds,
+                    "model_fit_seconds": model_fit_seconds,
+                    "input_dim": x_train.shape[1],
+                    "n_nonzero": int(x_train.nnz),
+                    "sparse_memory_mib": memory_mib,
+                    "device": "cpu",
+                    "best_iteration": np.nan,
+                    "pca_explained_variance": np.nan,
+                }
+            )
+            LOGGER.info(
+                "%s fold=%s year=%s dim=%s nnz=%s memory=%.1fMiB",
+                experiment,
+                fold_number,
+                validation_year,
+                x_train.shape[1],
+                x_train.nnz,
+                memory_mib,
+            )
+
+        if output_root is not None:
+            fold_dir = output_root / f"fold_{fold_number}_year_{validation_year}"
+            save_sparse_features_csv(
+                tfidf_train,
+                train_idx,
+                feature_names,
+                fold_dir / "train_features.csv.gz",
+                feature_names_path=fold_dir / "feature_names.csv.gz",
+            )
+            save_sparse_features_csv(
+                tfidf_valid,
+                valid_idx,
+                feature_names,
+                fold_dir / "valid_features.csv.gz",
+            )
+
+    return {
+        name: ExperimentResult(
+            name=name,
+            oof=oof[name],
+            fold_metrics=pd.DataFrame(fold_records[name]),
+            metadata={
+                "text_cols": list(text_cols),
+                "tfidf_config": dict(tfidf_config or {}),
+                "features_are_sparse": True,
+            },
+        )
+        for name in enabled_names
+    }
+
+
 def build_oof_predictions(
     results: Sequence[ExperimentResult],
     index: pd.Index,
@@ -1237,14 +1617,26 @@ def _full_tabular_transform(
     return train_values, test_values
 
 
+def _full_sparse_tabular_transform(
+    train_table: pd.DataFrame,
+    test_table: pd.DataFrame,
+    numeric_cols: Sequence[str],
+    categorical_cols: Sequence[str],
+) -> tuple[sparse.csr_matrix, sparse.csr_matrix]:
+    preprocessor = _make_sparse_tabular_preprocessor(numeric_cols, categorical_cols)
+    train_values = _as_float32_csr(preprocessor.fit_transform(train_table))
+    test_values = _as_float32_csr(preprocessor.transform(test_table))
+    return train_values, test_values
+
+
 def fit_full_and_predict_test(
     experiment: str,
     train: pd.DataFrame,
     test: pd.DataFrame,
-    train_embeddings: np.ndarray,
-    test_embeddings: np.ndarray,
-    train_embedding_metadata: pd.DataFrame,
-    test_embedding_metadata: pd.DataFrame,
+    train_embeddings: np.ndarray | None,
+    test_embeddings: np.ndarray | None,
+    train_embedding_metadata: pd.DataFrame | None,
+    test_embedding_metadata: pd.DataFrame | None,
     numeric_cols: Sequence[str],
     categorical_cols: Sequence[str],
     *,
@@ -1259,8 +1651,21 @@ def fit_full_and_predict_test(
     set_global_seed(seed)
     _validate_binary_target(train[target_col], target_col)
     y_train = train[target_col].to_numpy(dtype=np.float32)
-    uses_embedding = experiment != "E5_tabular_catboost"
+    uses_embedding = experiment in {
+        "E1_embedding_lr",
+        "E2_embedding_tabular_lr",
+        "E3_embedding_mlp",
+        "E4_embedding_tabular_mlp",
+        "T3_tfidf_embedding_tabular_lr",
+    } or experiment.startswith("E6_embedding_tabular_xgb")
     if uses_embedding:
+        if (
+            train_embeddings is None
+            or test_embeddings is None
+            or train_embedding_metadata is None
+            or test_embedding_metadata is None
+        ):
+            raise ValueError(f"{experiment} requires train/test embeddings and metadata.")
         train_matrix = validate_embedding_input(
             train,
             train_embeddings,
@@ -1279,7 +1684,13 @@ def fit_full_and_predict_test(
         train_matrix = np.empty((len(train), 0), dtype=np.float32)
         test_matrix = np.empty((len(test), 0), dtype=np.float32)
 
-    uses_tabular = experiment not in {"E1_embedding_lr", "E3_embedding_mlp"}
+    uses_tabular = experiment in {
+        "E2_embedding_tabular_lr",
+        "E4_embedding_tabular_mlp",
+        "E5_tabular_catboost",
+        "T2_tfidf_tabular_lr",
+        "T3_tfidf_embedding_tabular_lr",
+    } or experiment.startswith("E6_embedding_tabular_xgb")
     if uses_tabular:
         feature_config = dict(cfg["feature_engineering"])
         train_table, numeric, categorical = prepare_tabular_features(
@@ -1295,7 +1706,45 @@ def fit_full_and_predict_test(
         test_table = pd.DataFrame(index=test.index)
         numeric, categorical = [], []
 
-    if experiment == "E1_embedding_lr":
+    if experiment in {
+        "T1_tfidf_lr",
+        "T2_tfidf_tabular_lr",
+        "T3_tfidf_embedding_tabular_lr",
+    }:
+        if target_col in cfg["text_cols"]:
+            raise ValueError("target_col must never be included in TF-IDF text_cols.")
+        tfidf_train, tfidf_test, _, _ = fit_transform_tfidf_columns(
+            train_df=train,
+            transform_df=test,
+            text_cols=cfg["text_cols"],
+            tfidf_params=cfg["tfidf"],
+        )
+        tfidf_train = _as_float32_csr(tfidf_train)
+        tfidf_test = _as_float32_csr(tfidf_test)
+        if experiment == "T1_tfidf_lr":
+            x_train, x_test = tfidf_train, tfidf_test
+        else:
+            tab_train, tab_test = _full_sparse_tabular_transform(
+                train_table,
+                test_table,
+                numeric,
+                categorical,
+            )
+            if experiment == "T2_tfidf_tabular_lr":
+                x_train = _sparse_hstack(tfidf_train, tab_train)
+                x_test = _sparse_hstack(tfidf_test, tab_test)
+            else:
+                emb_train, emb_test = _transform_embeddings_with_fitted(
+                    train_matrix,
+                    test_matrix,
+                    str(cfg["embedding_scaling"]),
+                )
+                x_train = _sparse_hstack(tfidf_train, emb_train, tab_train)
+                x_test = _sparse_hstack(tfidf_test, emb_test, tab_test)
+        model = _tfidf_lr_from_config(cfg["tfidf_lr"], seed)
+        model.fit(x_train, y_train)
+        prediction = model.predict_proba(x_test)[:, 1]
+    elif experiment == "E1_embedding_lr":
         x_train, x_test = _transform_embeddings_with_fitted(
             train_matrix, test_matrix, str(cfg["embedding_scaling"])
         )
@@ -1373,8 +1822,8 @@ def fit_full_and_predict_test(
 def run_all_experiments(
     train: pd.DataFrame,
     folds: Sequence[tuple[pd.Index, pd.Index]],
-    train_embeddings: np.ndarray,
-    train_embedding_metadata: pd.DataFrame,
+    train_embeddings: np.ndarray | None,
+    train_embedding_metadata: pd.DataFrame | None,
     numeric_cols: Sequence[str],
     categorical_cols: Sequence[str],
     *,
@@ -1387,7 +1836,7 @@ def run_all_experiments(
     test_embeddings: np.ndarray | None = None,
     test_embedding_metadata: pd.DataFrame | None = None,
 ) -> ExperimentSuiteResult:
-    """Run enabled E1-E6 experiments with exactly the supplied time folds."""
+    """Run enabled E1-E6/T1-T3 with exactly the supplied time folds."""
     cfg = _merge_config(config)
     metric = _validate_metric(str(cfg["metric"]))
     seed = int(cfg["random_state"])
@@ -1403,6 +1852,14 @@ def run_all_experiments(
         "project_id_col": project_id_col,
     }
     results: list[ExperimentResult] = []
+    needs_train_embeddings = any(
+        bool(cfg[key])
+        for key in ("run_e1", "run_e2", "run_e3", "run_e4", "run_e6", "run_t3")
+    )
+    if needs_train_embeddings and (
+        train_embeddings is None or train_embedding_metadata is None
+    ):
+        raise ValueError("Enabled experiments require train embeddings and metadata.")
 
     if cfg["run_e1"]:
         results.append(
@@ -1489,6 +1946,30 @@ def run_all_experiments(
                     **embedding_common,
                 )
             )
+    tfidf_results = run_tfidf_lr_experiments(
+        df=train,
+        folds=folds,
+        text_cols=cfg["text_cols"],
+        numeric_cols=numeric_cols,
+        categorical_cols=categorical_cols,
+        embeddings=train_embeddings,
+        embedding_metadata=train_embedding_metadata,
+        run_t1=bool(cfg["run_t1"]),
+        run_t2=bool(cfg["run_t2"]),
+        run_t3=bool(cfg["run_t3"]),
+        target_col=target_col,
+        project_col=project_col,
+        project_id_col=project_id_col,
+        year_col=year_col,
+        metric=metric,
+        embedding_scaling=str(cfg["embedding_scaling"]),
+        tfidf_config=cfg["tfidf"],
+        tfidf_lr_config=cfg["tfidf_lr"],
+        feature_config=cfg["feature_engineering"],
+        tfidf_feature_output_dir=cfg["tfidf_feature_output_dir"],
+        random_state=seed,
+    )
+    results.extend(tfidf_results.values())
     if not results:
         raise ValueError("No experiment is enabled in config.")
 
@@ -1508,11 +1989,8 @@ def run_all_experiments(
 
     test_predictions: dict[str, np.ndarray] = {}
     if cfg["run_final_test_prediction"]:
-        if test is None or test_embeddings is None or test_embedding_metadata is None:
-            raise ValueError(
-                "test, test_embeddings, and test_embedding_metadata are required "
-                "when run_final_test_prediction=True."
-            )
+        if test is None:
+            raise ValueError("test is required when run_final_test_prediction=True.")
         selected = list(cfg.get("final_experiments", []))
         if not selected:
             raise ValueError(
@@ -1521,6 +1999,18 @@ def run_all_experiments(
         unknown = sorted(set(selected) - set(result_map))
         if unknown:
             raise ValueError(f"final_experiments were not run in CV: {unknown}")
+        embedding_free = {
+            "E5_tabular_catboost",
+            "T1_tfidf_lr",
+            "T2_tfidf_tabular_lr",
+        }
+        needs_embeddings = any(name not in embedding_free for name in selected)
+        if needs_embeddings and (
+            test_embeddings is None or test_embedding_metadata is None
+        ):
+            raise ValueError(
+                "Selected final experiments require test embeddings and metadata."
+            )
         prediction_dir = output_dir / "test_predictions"
         for experiment in selected:
             pca_dim = result_map[experiment].metadata.get("pca_dim")
@@ -1566,6 +2056,7 @@ __all__ = [
     "run_e4_embedding_tabular_mlp",
     "run_e5_tabular_catboost",
     "run_e6_embedding_tabular_xgboost",
+    "run_tfidf_lr_experiments",
     "save_experiment_outputs",
     "set_global_seed",
     "validate_embedding_input",

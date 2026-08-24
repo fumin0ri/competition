@@ -135,18 +135,24 @@ def _prefixed_feature_names(
     return np.concatenate(names) if names else np.array([], dtype=str)
 
 
-def _fit_transform_columns(
+def fit_transform_tfidf_columns(
     train_df: pd.DataFrame,
     transform_df: pd.DataFrame,
     text_cols: Sequence[str],
-    tfidf_params: Mapping[str, Any] | None,
+    tfidf_params: Mapping[str, Any] | None = None,
 ) -> tuple[
     sparse.csr_matrix,
     sparse.csr_matrix,
     dict[str, TfidfVectorizer],
     np.ndarray,
 ]:
-    """Fit each vectorizer on train only and transform a second dataset."""
+    """Fit column-wise TF-IDF on train only and transform another dataset."""
+    if not text_cols:
+        raise ValueError("text_cols must contain at least one column.")
+    if len(set(text_cols)) != len(text_cols):
+        raise ValueError("text_cols must not contain duplicates.")
+    _require_columns(train_df, text_cols)
+    _require_columns(transform_df, text_cols)
     train_matrices: list[sparse.spmatrix] = []
     transform_matrices: list[sparse.spmatrix] = []
     vectorizers: dict[str, TfidfVectorizer] = {}
@@ -173,6 +179,10 @@ def _fit_transform_columns(
     assert train_features.shape[1] == transform_features.shape[1]
     assert train_features.shape[1] == len(feature_names)
     return train_features, transform_features, vectorizers, feature_names
+
+
+# Backward-compatible internal alias for the existing notebook/API paths.
+_fit_transform_columns = fit_transform_tfidf_columns
 
 
 def save_sparse_features_csv(
@@ -565,6 +575,7 @@ __all__ = [
     "cross_validate_single_text_column",
     "cross_validate_text_columns",
     "fit_full_text_model_predict",
+    "fit_transform_tfidf_columns",
     "make_logistic_regression",
     "make_tfidf_vectorizer",
     "normalize_text",

@@ -9,6 +9,7 @@ from text_features import (
     compare_cv_results,
     cross_validate_text_columns,
     fit_full_text_model_predict,
+    fit_transform_tfidf_columns,
     normalize_text,
 )
 from validation import make_time_series_cv
@@ -86,6 +87,27 @@ class TextFeaturesTest(unittest.TestCase):
         vocabulary = set(result["vectorizers"]["project_name"].get_feature_names_out())
         self.assertNotIn("限定", vocabulary)
         self.assertEqual(result["test_pred"].index.tolist(), [999])
+
+    def test_public_transform_fits_vocabulary_on_train_only(self):
+        train_features, valid_features, vectorizers, names = (
+            fit_transform_tfidf_columns(
+                train_df=self.train.iloc[:4],
+                transform_df=pd.DataFrame(
+                    {
+                        "project_name": ["検証限定文字列"],
+                        "project_objective": ["検証限定目的"],
+                        "project_summary": ["検証限定概要"],
+                    },
+                    index=[999],
+                ),
+                text_cols=["project_name"],
+                tfidf_params=self.tfidf_params,
+            )
+        )
+        vocabulary = set(vectorizers["project_name"].get_feature_names_out())
+        self.assertNotIn("限定", vocabulary)
+        self.assertEqual(train_features.shape[1], valid_features.shape[1])
+        self.assertEqual(train_features.shape[1], len(names))
 
     def test_comparison_table(self):
         result = cross_validate_text_columns(

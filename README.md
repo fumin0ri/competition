@@ -193,7 +193,7 @@ result = generate_embeddings(
 )
 ```
 
-## Embedding + Tabularの6実験
+## Embedding + Tabular + TF-IDFの9実験
 
 `modeling.py`は、既存の同一時系列foldを使って次を比較します。
 
@@ -205,6 +205,11 @@ result = generate_embeddings(
 | E4 | Embedding + tabular | PyTorch MLP |
 | E5 | tabular | CatBoost |
 | E6 | Embedding + tabular | XGBoost |
+| T1 | char TF-IDF | Logistic Regression |
+| T2 | char TF-IDF + tabular | Logistic Regression |
+| T3 | char TF-IDF + Embedding + tabular | Logistic Regression |
+
+T1〜T3は各foldで列別char TF-IDFを一度だけfitして共有します。validationは`transform`にしか使いません。T2/T3のtabular前処理もfold trainingだけでfitし、T3のEmbeddingはL2正規化後にCSR化します。全ブロックを`scipy.sparse.hstack`で結合するため、raw TF-IDFをdense化しません。
 
 T4 x1を使う既定設定では、E3/E4がCUDA + mixed precision、E5が`task_type="GPU", devices="0"`、E6が`device="cuda", tree_method="hist"`です。LR、scikit-learn前処理、PCAはCPUで動きます。CPU環境では次のように変更できます。
 
@@ -219,7 +224,19 @@ CONFIG["xgboost"]["device"] = "cpu"
 
 E1/E2のLRは、denseなEmbeddingと中規模の特徴数に対する堅実なbaselineとして`lbfgs`を既定にしています。Embeddingがほぼ全要素non-zeroなので、CSR化によるindex領域の増加を避け、OneHotを含めて`float32`のdense結合を使います。高cardinalityカテゴリを大量に追加する場合は入力次元と表示されるメモリ警告を確認してください。
 
+T1〜T3のLRは、行数より特徴数が多い高次元疎行列を想定して`liblinear, dual=True`を既定にしています。収束警告が出る場合は`CONFIG["tfidf_lr"]`の`max_iter`や`tol`を調整できます。
+
 実行は`notebooks/04_embedding_models.ipynb`から行います。Notebookは初期状態で`RUN_CV=False`、`run_final_test_prediction=False`のため、明示的に有効化するまで重い学習やtest予測を開始しません。
+
+TF-IDF設定と生成特徴量の保存先もconfigから変更できます。
+
+```python
+CONFIG["text_cols"] = ["project_name", "project_objective", "project_summary"]
+CONFIG["tfidf"]["max_features"] = 300_000
+CONFIG["tfidf_feature_output_dir"] = "data/csv/tfidf_shared"
+```
+
+共有TF-IDF特徴は`data/csv/tfidf_shared/fold_<n>_year_<year>/`へlong形式の圧縮CSVとして一度だけ保存します。T3はdenseなEmbeddingをCSRへ変換するため、`fold_metrics`へ`n_nonzero`と`sparse_memory_mib`を記録します。
 
 前処理のimputer、scaler、OneHotEncoderとoptional PCAはfold trainingだけでfitします。OOFの古い年度は`NaN`のまま保持し、以下へ保存します。
 
