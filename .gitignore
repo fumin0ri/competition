@@ -5,3 +5,7 @@ __pycache__/
 # Competition data must not be committed.
 input/*
 !input/.gitkeep
+
+# Generated features, predictions, and experiment results.
+data/*
+!data/.gitkeep
