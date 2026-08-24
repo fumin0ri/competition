@@ -11,11 +11,14 @@ competition/
 │   └── test.csv               # Git管理対象外
 ├── notebooks/
 │   ├── 01_time_series_cv.ipynb
-│   └── 02_char_tfidf_logreg.ipynb
+│   ├── 02_char_tfidf_logreg.ipynb
+│   └── 03_generate_embeddings.ipynb
 ├── tests/
 │   ├── test_validation.py
-│   └── test_text_features.py
+│   ├── test_text_features.py
+│   └── test_embedding_features.py
 ├── requirements.txt
+├── embedding_features.py      # 外部Embedding API・resume・保存
 ├── text_features.py           # char TF-IDF・Logistic Regression
 ├── validation.py              # CV・seen/unseen判定
 └── README.md
@@ -142,3 +145,46 @@ data/csv/
 ```
 
 CSVは非常に大きくなる可能性があります。`feature_output_dir=None`にすると保存を無効化できます。
+
+## 外部Embedding API
+
+`embedding_features.py`はOpenAIとGoogle Geminiに対応し、生成物を`data/embeddings/`へ保存します。APIキーは環境変数から読み込み、コード・ログ・保存ファイルには含めません。
+
+```powershell
+$env:OPENAI_API_KEY="..."
+# または
+$env:GEMINI_API_KEY="..."
+```
+
+最初に`notebooks/03_generate_embeddings.ipynb`のdry-runで、行数、文字数、推定token、推定費用、truncate候補を確認します。少量の疎通確認は`RUN_SMOKE_API`、全件生成は`RUN_FULL_API`を明示的に`True`へ変更した場合だけ実行します。
+
+```text
+data/embeddings/
+└── openai_text-embedding-3-large_dim1536_<config-hash>/
+    ├── config.json
+    ├── train_embeddings.npy
+    ├── train_metadata.parquet
+    ├── train_progress.json
+    ├── test_embeddings.npy
+    ├── test_metadata.parquet
+    ├── test_progress.json
+    └── shards/
+```
+
+batchごとにshardを保存するため、中断後は取得済みbatchを再利用して続きから再開します。provider、model、dimension、使用列、template、正規化、text hashが一致しないcacheは再利用しません。
+
+既定モデルはOpenAIが`text-embedding-3-large`、Geminiが`gemini-embedding-2`です。次元数は既定で1536、`None`ならモデル既定値を使用します。Gemini Embedding 2の分類用途は、現在のAPI仕様に合わせてテキスト先頭へtask prefixを付けます。利用可能モデルを確認したい場合は`list_embedding_models()`を使い、利用不能時に別モデルへ自動fallbackはしません。
+
+```python
+from embedding_features import generate_embeddings
+
+result = generate_embeddings(
+    df=train,
+    split="train",
+    provider="openai",
+    model="text-embedding-3-large",
+    embedding_dim=1536,
+    output_root="data/embeddings",
+    dry_run=True,  # APIは呼ばない
+)
+```
