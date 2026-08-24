@@ -10,6 +10,7 @@ competition/
 │   ├── train.csv              # Git管理対象外
 │   └── test.csv               # Git管理対象外
 ├── notebooks/
+│   ├── 00_quick_eda.ipynb
 │   ├── 01_time_series_cv.ipynb
 │   ├── 02_char_tfidf_logreg.ipynb
 │   ├── 03_generate_embeddings.ipynb
@@ -35,13 +36,30 @@ competition/
 1. `input/`に`train.csv`や`test.csv`を配置します。CSVは`.gitignore`によりGitへ追加されません。
 2. `python -m pip install -r requirements.txt`で必要パッケージを用意します。
 3. リポジトリのルート、または`notebooks/`からJupyterを起動します。
-4. `notebooks/01_time_series_cv.ipynb`を開き、設定セルの列名を実データに合わせます。
-5. 上から実行し、`diagnostics`で各foldの年度、件数、target平均、seen/unseen比率を確認します。
+4. `notebooks/00_quick_eda.ipynb`を開き、設定セルの列名を実データに合わせて基本EDAを実行します。
+5. `01_time_series_cv.ipynb`で各foldの年度、件数、target平均、seen/unseen比率を確認します。
 6. `02_char_tfidf_logreg.ipynb`で列別・全列結合のchar TF-IDFを評価します。
 
 ```powershell
 jupyter lab
 ```
+
+## Quick EDA
+
+`notebooks/00_quick_eda.ipynb`はbaseline前に短時間でデータ全体を把握するためのNotebookです。次を表とグラフで確認します。
+
+- train/testの行列数、型、重複、ID、列差
+- target件数・比率
+- train/testの欠損率
+- 年度別件数、target率、クラス件数
+- expanding-window CVの件数、target率、seen project率
+- 数値列のtrain/test histogram、target別boxplot、Spearman相関
+- カテゴリ上位構成比とカテゴリ別target率
+- 日本語テキストの文字数、空文字率、target差、年度推移
+- `project_name`の重複、target矛盾、train/test overlap
+- 数値KS統計量・カテゴリtotal variationによる単変量のtrain/test差
+
+描画処理だけ最大5万行へsamplingし、集計値は全行から計算します。列が存在しない場合は自動的に可視化対象から外れます。`SAVE_FIGURES=True`にすると、画像をGit管理対象外の`data/eda_figures/`へ保存します。モデルを使うadversarial validationはこのNotebookでは実行しません。
 
 ## 時系列CV
 
