@@ -12,13 +12,17 @@ competition/
 ├── notebooks/
 │   ├── 01_time_series_cv.ipynb
 │   ├── 02_char_tfidf_logreg.ipynb
-│   └── 03_generate_embeddings.ipynb
+│   ├── 03_generate_embeddings.ipynb
+│   └── 04_embedding_models.ipynb
+├── outputs/                    # モデルOOF・評価・test予測（Git管理対象外）
 ├── tests/
 │   ├── test_validation.py
 │   ├── test_text_features.py
-│   └── test_embedding_features.py
+│   ├── test_embedding_features.py
+│   └── test_modeling.py
 ├── requirements.txt
 ├── embedding_features.py      # 外部Embedding API・resume・保存
+├── modeling.py                # Embedding + tabularの6モデル比較
 ├── text_features.py           # char TF-IDF・Logistic Regression
 ├── validation.py              # CV・seen/unseen判定
 └── README.md
@@ -188,3 +192,50 @@ result = generate_embeddings(
     dry_run=True,  # APIは呼ばない
 )
 ```
+
+## Embedding + Tabularの6実験
+
+`modeling.py`は、既存の同一時系列foldを使って次を比較します。
+
+| ID | 入力 | モデル |
+|---|---|---|
+| E1 | Embedding | Logistic Regression |
+| E2 | Embedding + tabular | Logistic Regression |
+| E3 | Embedding | PyTorch MLP |
+| E4 | Embedding + tabular | PyTorch MLP |
+| E5 | tabular | CatBoost |
+| E6 | Embedding + tabular | XGBoost |
+
+T4 x1を使う既定設定では、E3/E4がCUDA + mixed precision、E5が`task_type="GPU", devices="0"`、E6が`device="cuda", tree_method="hist"`です。LR、scikit-learn前処理、PCAはCPUで動きます。CPU環境では次のように変更できます。
+
+```python
+from modeling import default_modeling_config
+
+CONFIG = default_modeling_config()
+CONFIG["mlp"]["device"] = "cpu"
+CONFIG["catboost"]["task_type"] = "CPU"
+CONFIG["xgboost"]["device"] = "cpu"
+```
+
+E1/E2のLRは、denseなEmbeddingと中規模の特徴数に対する堅実なbaselineとして`lbfgs`を既定にしています。Embeddingがほぼ全要素non-zeroなので、CSR化によるindex領域の増加を避け、OneHotを含めて`float32`のdense結合を使います。高cardinalityカテゴリを大量に追加する場合は入力次元と表示されるメモリ警告を確認してください。
+
+実行は`notebooks/04_embedding_models.ipynb`から行います。Notebookは初期状態で`RUN_CV=False`、`run_final_test_prediction=False`のため、明示的に有効化するまで重い学習やtest予測を開始しません。
+
+前処理のimputer、scaler、OneHotEncoderとoptional PCAはfold trainingだけでfitします。OOFの古い年度は`NaN`のまま保持し、以下へ保存します。
+
+```text
+outputs/
+├── oof_predictions.parquet
+├── fold_metrics.parquet
+├── experiment_summary.parquet
+├── experiment_summary.csv
+└── test_predictions/
+```
+
+PCAなしが既定です。比較するときだけ変更します。
+
+```python
+CONFIG["e6_pca_dims"] = [None, 512, 256]
+```
+
+CatBoostのGPU学習は公式仕様上、同じseedでもbitwise deterministicではありません。厳密な再現性が必要な最終比較では`task_type="CPU"`も確認してください。

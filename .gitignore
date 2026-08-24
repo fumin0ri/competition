@@ -9,3 +9,7 @@ input/*
 # Generated features, predictions, and experiment results.
 data/*
 !data/.gitkeep
+
+# OOF, fold metrics, and final test predictions.
+outputs/*
+!outputs/.gitkeep
