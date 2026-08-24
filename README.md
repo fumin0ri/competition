@@ -44,6 +44,21 @@ competition/
 jupyter lab
 ```
 
+## target列
+
+このコンペのtarget列は`science_tech_decision`で、配布時は文字列ラベルです。各NotebookはCSV読込直後に共通関数で厳密に二値化します。
+
+```python
+from validation import encode_binary_target
+
+TARGET_COL = "science_tech_decision"
+train[TARGET_COL] = encode_binary_target(train[TARGET_COL])
+# 該当 -> 1
+# 非該当 -> 0
+```
+
+前後の空白は除去しますが部分一致は使いません。`非該当`に`該当`という文字列が含まれるためです。未知ラベルや欠損値は誤変換せずエラーにします。すでに0/1へ変換済みの場合も同じ関数を安全に再適用できます。
+
 ## Quick EDA
 
 `notebooks/00_quick_eda.ipynb`はbaseline前に短時間でデータ全体を把握するためのNotebookです。次を表とグラフで確認します。
@@ -72,7 +87,7 @@ folds, diagnostics = make_time_series_cv(
     df=train,
     year_col="project_start_year",
     project_col="project_name",
-    target_col="target",
+    target_col="science_tech_decision",
     n_valid_years=3,
 )
 
@@ -135,7 +150,7 @@ combined_result = cross_validate_text_columns(
     df=train,
     folds=folds,
     text_cols=["project_name", "project_objective", "project_summary"],
-    target_col="target",
+    target_col="science_tech_decision",
     project_col="project_name",
     year_col="project_start_year",
     model_name="all_columns_char_tfidf",
@@ -315,7 +330,7 @@ Notebook 04は3目的関数×2 blend modeの6通りを同じ表へ出します�
 Notebook 04の最終セルは、正のensemble weightを持つモデルだけを全trainで再fitし、test予測を同じ重みで合成します。`ID_COL`の値と行順をtestからそのまま保持し、`outputs/submission.csv`を次の2列で作成します。
 
 ```text
-<ID_COL>,target
+<ID_COL>,science_tech_decision
 ```
 
 提出前にはNotebookが、IDの欠損・重複、予測件数、不正な確率、CSV再読込後の列と行順を検査します。hill climbingはOOFへの追加最適化なので、単体モデルより過学習しやすい点には注意し、各fold AUCや最新foldの傾向も併せて判断してください。

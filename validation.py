@@ -25,6 +25,44 @@ DIAGNOSTIC_COLUMNS = [
 ]
 
 
+def encode_binary_target(
+    target: pd.Series,
+    *,
+    positive_label: str = "該当",
+    negative_label: str = "非該当",
+) -> pd.Series:
+    """Encode the competition labels as 1/0 without mutating the input Series.
+
+    Existing numeric or string 0/1 values are accepted so the operation is
+    idempotent. Labels are stripped before exact matching; substring matching is
+    intentionally avoided because ``negative_label`` contains ``positive_label``.
+    """
+    if not isinstance(target, pd.Series):
+        raise TypeError("target must be a pandas Series.")
+    if positive_label == negative_label:
+        raise ValueError("positive_label and negative_label must differ.")
+    if target.isna().any():
+        raise ValueError(f"{target.name or 'target'!r} contains missing values.")
+
+    text = target.astype("string").str.strip()
+    mapping = {
+        str(positive_label).strip(): 1,
+        str(negative_label).strip(): 0,
+        "1": 1,
+        "0": 0,
+        "True": 1,
+        "False": 0,
+    }
+    encoded = text.map(mapping)
+    if encoded.isna().any():
+        unknown = sorted(text.loc[encoded.isna()].unique().tolist())[:10]
+        raise ValueError(
+            f"{target.name or 'target'!r} contains unknown labels: {unknown}. "
+            f"Expected {positive_label!r}/{negative_label!r} or 1/0."
+        )
+    return encoded.astype(np.int8).rename(target.name)
+
+
 def _require_columns(df: pd.DataFrame, columns: list[str]) -> None:
     missing = [column for column in columns if column not in df.columns]
     if missing:
@@ -196,4 +234,9 @@ def make_time_series_cv(
     return folds, diagnostics
 
 
-__all__ = ["Fold", "make_seen_project_mask", "make_time_series_cv"]
+__all__ = [
+    "Fold",
+    "encode_binary_target",
+    "make_seen_project_mask",
+    "make_time_series_cv",
+]

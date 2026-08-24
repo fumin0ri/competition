@@ -3,7 +3,7 @@ import warnings
 
 import pandas as pd
 
-from validation import make_seen_project_mask, make_time_series_cv
+from validation import encode_binary_target, make_seen_project_mask, make_time_series_cv
 
 
 class TimeSeriesCVTest(unittest.TestCase):
@@ -67,6 +67,24 @@ class TimeSeriesCVTest(unittest.TestCase):
         self.assertEqual(folds, [])
         self.assertTrue(diagnostics.empty)
         self.assertTrue(any("training data is empty" in str(w.message) for w in caught))
+
+    def test_encode_binary_target_maps_competition_labels_and_is_idempotent(self):
+        raw = pd.Series(
+            ["該当", "非該当", " 該当 ", 1, "0", True],
+            index=[3, 7, 11, 20, 21, 30],
+            name="science_tech_decision",
+        )
+        encoded = encode_binary_target(raw)
+        self.assertEqual(encoded.tolist(), [1, 0, 1, 1, 0, 1])
+        self.assertEqual(encoded.index.tolist(), raw.index.tolist())
+        self.assertEqual(encoded.name, "science_tech_decision")
+        self.assertEqual(str(encoded.dtype), "int8")
+
+    def test_encode_binary_target_rejects_unknown_or_missing_labels(self):
+        with self.assertRaisesRegex(ValueError, "unknown labels"):
+            encode_binary_target(pd.Series(["該当", "対象外"], name="label"))
+        with self.assertRaisesRegex(ValueError, "missing"):
+            encode_binary_target(pd.Series(["該当", None], name="label"))
 
 
 if __name__ == "__main__":
