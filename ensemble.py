@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -462,6 +464,111 @@ def make_submission(
     return submission
 
 
+def make_profile_submissions(
+    test: pd.DataFrame,
+    test_predictions: Mapping[str, Sequence[float]],
+    ensemble_results: Mapping[str, HillClimbingEnsembleResult],
+    *,
+    id_col: str,
+    prediction_col: str = "target",
+    output_dir: str | Path = "outputs/submissions",
+    canonical_profile: str | None = None,
+    canonical_output_path: str | Path | None = None,
+) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
+    """Write one submission per ensemble profile and a comparison manifest.
+
+    Each profile reuses the supplied base-model test predictions. Profile names
+    are restricted to filename-safe characters because they become part of the
+    output filename. When ``canonical_profile`` is specified, its prediction is
+    also written to ``canonical_output_path`` for submission-tool compatibility.
+    """
+    if not ensemble_results:
+        raise ValueError("ensemble_results must contain at least one profile.")
+    if canonical_profile is not None and canonical_profile not in ensemble_results:
+        raise KeyError(f"Unknown canonical_profile: {canonical_profile!r}")
+    if canonical_output_path is not None and canonical_profile is None:
+        raise ValueError(
+            "canonical_output_path requires canonical_profile to be specified."
+        )
+
+    directory = Path(output_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    submissions: dict[str, pd.DataFrame] = {}
+    records: list[dict[str, object]] = []
+    for profile, result in ensemble_results.items():
+        is_safe_name = isinstance(profile, str) and re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9_.-]*", profile
+        )
+        if not is_safe_name:
+            raise ValueError(
+                "Ensemble profile names must start with an alphanumeric character "
+                "and contain only letters, numbers, '_', '-', or '.'."
+            )
+        if not isinstance(result, HillClimbingEnsembleResult):
+            raise TypeError(
+                f"ensemble_results[{profile!r}] must be HillClimbingEnsembleResult."
+            )
+        prediction = blend_test_predictions(
+            test_predictions,
+            result.weights,
+            blend_mode=result.blend_mode,
+        )
+        path = directory / f"submission_{profile}.csv"
+        submissions[profile] = make_submission(
+            test,
+            prediction,
+            id_col=id_col,
+            prediction_col=prediction_col,
+            output_path=path,
+        )
+        fold_weights = [
+            None if pd.isna(value) else float(value)
+            for value in result.fold_weights.to_numpy()
+        ]
+        model_weights = {
+            str(name): float(weight)
+            for name, weight in result.weights[result.weights > 0].items()
+        }
+        records.append(
+            {
+                "profile": profile,
+                "is_canonical": profile == canonical_profile,
+                "submission_path": str(path),
+                "objective": result.objective,
+                "blend_mode": result.blend_mode,
+                "objective_score": result.score,
+                "pooled_auc": result.pooled_auc,
+                "mean_fold_auc": result.fold_scores["roc_auc"].mean(),
+                "latest_fold_auc": result.fold_scores.iloc[-1]["roc_auc"],
+                "n_models": int(result.weights.gt(0).sum()),
+                "n_scored_rows": result.n_scored_rows,
+                "fold_weights": json.dumps(fold_weights),
+                "model_weights": json.dumps(model_weights, sort_keys=True),
+            }
+        )
+
+    if canonical_profile is not None:
+        canonical_prediction = submissions[canonical_profile][prediction_col].to_numpy()
+        make_submission(
+            test,
+            canonical_prediction,
+            id_col=id_col,
+            prediction_col=prediction_col,
+            output_path=(
+                canonical_output_path
+                if canonical_output_path is not None
+                else directory / "submission.csv"
+            ),
+        )
+
+    manifest = pd.DataFrame(records)
+    manifest_path = directory / "submission_manifest.csv"
+    temporary = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+    manifest.to_csv(temporary, index=False)
+    temporary.replace(manifest_path)
+    return submissions, manifest
+
+
 def save_ensemble_outputs(
     result: HillClimbingEnsembleResult,
     output_dir: str | Path = "outputs",
@@ -502,6 +609,7 @@ __all__ = [
     "blend_test_predictions",
     "evaluate_fold_auc",
     "hill_climb_auc",
+    "make_profile_submissions",
     "make_submission",
     "save_ensemble_outputs",
 ]

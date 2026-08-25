@@ -324,12 +324,16 @@ outputs/
 ├── fold_metrics.parquet
 ├── experiment_summary.parquet
 ├── experiment_summary.csv
-├── ensemble_weights.csv
-├── ensemble_history.csv
-├── ensemble_fold_scores.csv
-├── ensemble_summary.csv
-├── ensemble_oof.parquet
+├── ensemble_profile_comparison.csv
+├── ensembles/
+│   └── <profile>/             # profile別のweight・history・fold score・OOF
 ├── submission.csv
+├── submissions/
+│   ├── submission_uniform_rank.csv
+│   ├── submission_recent_20_30_50_rank.csv
+│   ├── submission_recent_10_20_70_rank.csv
+│   ├── submission_recent_20_30_50_probability.csv
+│   └── submission_manifest.csv
 └── test_predictions/
 ```
 
@@ -362,15 +366,42 @@ print("weighted fold AUC:", ensemble_result.score)
 print("pooled OOF AUC:", ensemble_result.pooled_auc)
 ```
 
-Notebook 04は3目的関数×2 blend modeの6通りを同じ表へ出します。OOF上の最高値を自動採用すると選択バイアスが増えるため、既定では`SELECTED_ENSEMBLE="weighted_rank"`を明示し、比較表を見て人が変更する設計です。重みの個数が実際のfold数と違う場合はエラーにします。
+Notebook 04は、年度driftへの仮説を`ENSEMBLE_PROFILES`として複数定義します。既定では、全fold均等rank、最新年度を20/30/50または10/20/70で重視するrank、20/30/50のprobability blendを比較します。ここでのfold weightはtest年度を直接重み付けする値ではなく、hill climbingが各モデルの混合比を選ぶ際のfold AUCの重要度です。
 
-Notebook 04の最終セルは、正のensemble weightを持つモデルだけを全trainで再fitし、test予測を同じ重みで合成します。`ID_COL`の値と行順をtestからそのまま保持し、`outputs/submission.csv`を次の2列で作成します。
+```python
+ENSEMBLE_PROFILES = {
+    "uniform_rank": {
+        "objective": "weighted_fold_auc",
+        "blend_mode": "rank",
+        "fold_weights": [1, 1, 1],
+    },
+    "recent_20_30_50_rank": {
+        "objective": "weighted_fold_auc",
+        "blend_mode": "rank",
+        "fold_weights": [0.2, 0.3, 0.5],
+    },
+    "recent_10_20_70_rank": {
+        "objective": "weighted_fold_auc",
+        "blend_mode": "rank",
+        "fold_weights": [0.1, 0.2, 0.7],
+    },
+    "recent_20_30_50_probability": {
+        "objective": "weighted_fold_auc",
+        "blend_mode": "probability",
+        "fold_weights": [0.2, 0.3, 0.5],
+    },
+}
+```
+
+profileは自由に追加・削除できますが、`fold_weights`の個数は実際のfold数と一致させます。OOF上の最高値を自動採用すると選択バイアスが増えるため、基準profileは`SELECTED_ENSEMBLE_PROFILE`で明示します。
+
+Notebook 04の最終セルは、全profileで正のensemble weightを持つモデルの和集合だけを全trainで一度ずつ再fitし、そのtest予測をprofile間で共有します。profile別の提出ファイルは`outputs/submissions/submission_<profile>.csv`、設定・CV値・モデル重みの一覧は`submission_manifest.csv`へ保存します。選択した基準profileは従来互換の`outputs/submission.csv`にも同内容で保存します。すべてのCSVは`ID_COL`の値と行順をtestからそのまま保持し、次の2列で作成します。
 
 ```text
 <ID_COL>,science_tech_decision
 ```
 
-提出前にはNotebookが、IDの欠損・重複、予測件数、不正な確率、CSV再読込後の列と行順を検査します。hill climbingはOOFへの追加最適化なので、単体モデルより過学習しやすい点には注意し、各fold AUCや最新foldの傾向も併せて判断してください。
+提出前にはNotebookが、IDの欠損・重複、予測件数、不正な確率、CSV再読込後の列と行順を検査します。複数profileをLeaderboardへ出す場合も、結果を見て細かく重みを刻み続けるとPublic LBへ過適合します。まず仮説の異なる少数profileを比較し、`submission_manifest.csv`と提出スコアの対応を記録してください。
 
 PCAなしが既定です。比較するときだけ変更します。
 

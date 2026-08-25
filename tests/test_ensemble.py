@@ -9,6 +9,7 @@ from ensemble import (
     blend_test_predictions,
     evaluate_fold_auc,
     hill_climb_auc,
+    make_profile_submissions,
     make_submission,
     save_ensemble_outputs,
 )
@@ -175,6 +176,73 @@ class EnsembleTests(unittest.TestCase):
         test = pd.DataFrame({"project_id": ["a", "a"]})
         with self.assertRaisesRegex(ValueError, "unique"):
             make_submission(test, [0.2, 0.8], id_col="project_id")
+
+    def test_make_profile_submissions_writes_variants_manifest_and_canonical(self):
+        probability_result = hill_climb_auc(
+            self.oof,
+            self.target,
+            folds=self.folds,
+            objective="weighted_fold_auc",
+            fold_weights=[0.5, 0.5],
+            blend_mode="probability",
+        )
+        rank_result = hill_climb_auc(
+            self.oof,
+            self.target,
+            folds=self.folds,
+            objective="weighted_fold_auc",
+            fold_weights=[0.2, 0.8],
+            blend_mode="rank",
+        )
+        test = pd.DataFrame({"project_id": ["z", "a", "m"]})
+        predictions = {
+            "model_a": np.array([0.2, 0.8, 0.5]),
+            "model_b": np.array([0.9, 0.1, 0.4]),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            submissions, manifest = make_profile_submissions(
+                test,
+                predictions,
+                {
+                    "uniform_probability": probability_result,
+                    "recent_rank": rank_result,
+                },
+                id_col="project_id",
+                prediction_col="science_tech_decision",
+                output_dir=root / "submissions",
+                canonical_profile="recent_rank",
+                canonical_output_path=root / "submission.csv",
+            )
+            loaded_manifest = pd.read_csv(root / "submissions/submission_manifest.csv")
+            canonical = pd.read_csv(root / "submission.csv")
+
+            self.assertTrue(
+                (root / "submissions/submission_uniform_probability.csv").exists()
+            )
+            self.assertTrue((root / "submissions/submission_recent_rank.csv").exists())
+        self.assertEqual(set(submissions), {"uniform_probability", "recent_rank"})
+        self.assertEqual(manifest["profile"].tolist(), loaded_manifest["profile"].tolist())
+        self.assertEqual(int(manifest["is_canonical"].sum()), 1)
+        self.assertEqual(
+            canonical["science_tech_decision"].tolist(),
+            submissions["recent_rank"]["science_tech_decision"].tolist(),
+        )
+        self.assertIn("0.8", manifest.loc[1, "fold_weights"])
+        self.assertIn("model_", manifest.loc[1, "model_weights"])
+
+    def test_make_profile_submissions_rejects_unsafe_profile_name(self):
+        result = hill_climb_auc(self.oof, self.target, weight_grid=[0.15])
+        test = pd.DataFrame({"project_id": ["a"]})
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "profile names"):
+                make_profile_submissions(
+                    test,
+                    {"model_a": [0.5], "model_b": [0.4]},
+                    {"../unsafe": result},
+                    id_col="project_id",
+                    output_dir=directory,
+                )
 
 
 if __name__ == "__main__":
