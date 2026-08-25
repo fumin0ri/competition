@@ -9,7 +9,7 @@ import pandas as pd
 
 from embedding_features import (
     build_embedding_text,
-    embed_sagemaker,
+    embed_bedrock,
     generate_embeddings,
     l2_normalize_embeddings,
     load_embeddings,
@@ -49,114 +49,156 @@ class EmbeddingFeatureTests(unittest.TestCase):
         )
         self.assertEqual(build_embedding_text(empty), "[EMPTY]")
 
-    def test_sagemaker_default_adapter_invokes_realtime_endpoint(self):
+    def test_bedrock_titan_adapter_invokes_model_once_per_text(self):
         class RuntimeClient:
             def __init__(self):
                 self.calls = []
 
-            def invoke_endpoint(self, **kwargs):
+            def invoke_model(self, **kwargs):
                 self.calls.append(kwargs)
-                request = json.loads(kwargs["Body"].decode("utf-8"))
-                vectors = [[float(len(text)), 1.0, 2.0] for text in request["inputs"]]
-                return {"Body": io.BytesIO(json.dumps({"embeddings": vectors}).encode())}
+                request = json.loads(kwargs["body"].decode("utf-8"))
+                dimension = request.get("dimensions", 1024)
+                response = {
+                    "embedding": [float(len(request["inputText"]))] + [1.0] * (dimension - 1),
+                    "inputTextTokenCount": 4,
+                }
+                return {"body": io.BytesIO(json.dumps(response).encode())}
 
         runtime = RuntimeClient()
-        matrix, usage = embed_sagemaker(
+        matrix, usage = embed_bedrock(
             ["a", "日本語"],
             runtime,
-            "jp-embedding-v1",
-            3,
-            endpoint_name="competition-embedding-endpoint",
+            "amazon.titan-embed-text-v2:0",
+            256,
+            max_retries=0,
         )
-        self.assertEqual(matrix.shape, (2, 3))
-        self.assertEqual(usage, {})
-        self.assertEqual(len(runtime.calls), 1)
-        self.assertEqual(
-            runtime.calls[0]["EndpointName"], "competition-embedding-endpoint"
-        )
-        self.assertEqual(runtime.calls[0]["ContentType"], "application/json")
+        self.assertEqual(matrix.shape, (2, 256))
+        self.assertEqual(usage, {"total_tokens": 8})
+        self.assertEqual(len(runtime.calls), 2)
+        self.assertEqual(runtime.calls[0]["modelId"], "amazon.titan-embed-text-v2:0")
+        self.assertEqual(runtime.calls[0]["contentType"], "application/json")
+        first_request = json.loads(runtime.calls[0]["body"].decode("utf-8"))
+        self.assertEqual(first_request["inputText"], "a")
+        self.assertEqual(first_request["dimensions"], 256)
+        self.assertTrue(first_request["normalize"])
 
-    def test_sagemaker_custom_request_and_response_adapters(self):
+    def test_bedrock_retries_only_the_failed_text(self):
         class RuntimeClient:
-            def invoke_endpoint(self, **kwargs):
-                request = json.loads(kwargs["Body"].decode("utf-8"))
+            def __init__(self):
+                self.seen = []
+                self.failed_once = False
+
+            def invoke_model(self, **kwargs):
+                request = json.loads(kwargs["body"].decode("utf-8"))
+                text = request["inputText"]
+                self.seen.append(text)
+                if text == "two" and not self.failed_once:
+                    self.failed_once = True
+                    raise TimeoutError("temporary Bedrock timeout")
+                dimension = request["dimensions"]
+                response = {
+                    "embedding": [float(len(text))] + [1.0] * (dimension - 1),
+                    "inputTextTokenCount": 1,
+                }
+                return {"body": io.BytesIO(json.dumps(response).encode())}
+
+        runtime = RuntimeClient()
+        matrix, usage = embed_bedrock(
+            ["one", "two"],
+            runtime,
+            "amazon.titan-embed-text-v2:0",
+            256,
+            max_retries=1,
+            initial_backoff_seconds=0.0,
+        )
+        self.assertEqual(matrix.shape, (2, 256))
+        self.assertEqual(usage, {"total_tokens": 2})
+        self.assertEqual(runtime.seen, ["one", "two", "two"])
+
+    def test_bedrock_custom_request_and_response_adapters(self):
+        class RuntimeClient:
+            def invoke_model(self, **kwargs):
+                request = json.loads(kwargs["body"].decode("utf-8"))
                 self.request = request
                 self.kwargs = kwargs
-                response = {"result": [[3.0, 4.0] for _ in request["sentences"]]}
-                return {"Body": io.BytesIO(json.dumps(response).encode())}
+                response = {"result": [3.0, 4.0]}
+                return {"body": io.BytesIO(json.dumps(response).encode())}
 
         runtime = RuntimeClient()
 
-        def request_builder(texts, model, embedding_dim):
+        def request_builder(text, model, embedding_dim):
             return {
-                "sentences": list(texts),
+                "sentence": text,
                 "parameters": {"model": model, "dimension": embedding_dim},
             }
 
-        def response_parser(body, expected_rows):
+        def response_parser(body):
             payload = json.loads(body.decode("utf-8"))
-            self.assertEqual(len(payload["result"]), expected_rows)
             return np.asarray(payload["result"], dtype=np.float32), {"total_tokens": 7}
 
-        matrix, usage = embed_sagemaker(
+        matrix, usage = embed_bedrock(
             ["one", "two"],
             runtime,
-            "custom-model-contract",
+            "custom-model-arn",
             2,
-            endpoint_name="custom-endpoint",
             request_builder=request_builder,
             response_parser=response_parser,
-            invoke_endpoint_kwargs={"TargetVariant": "variant-b"},
+            invoke_model_kwargs={"performanceConfigLatency": "optimized"},
+            max_retries=0,
         )
         np.testing.assert_allclose(matrix, [[3.0, 4.0], [3.0, 4.0]])
-        self.assertEqual(usage["total_tokens"], 7)
+        self.assertEqual(usage["total_tokens"], 14)
         self.assertEqual(runtime.request["parameters"]["dimension"], 2)
-        self.assertEqual(runtime.kwargs["TargetVariant"], "variant-b")
+        self.assertEqual(runtime.kwargs["performanceConfigLatency"], "optimized")
 
-    def test_sagemaker_generate_uses_endpoint_and_adapter_cache_identity(self):
+    def test_bedrock_generate_uses_model_and_adapter_cache_identity(self):
         class RuntimeClient:
-            def invoke_endpoint(self, **kwargs):
-                request = json.loads(kwargs["Body"].decode("utf-8"))
-                vectors = [[1.0, 2.0, 3.0] for _ in request["inputs"]]
-                return {"Body": io.BytesIO(json.dumps(vectors).encode())}
+            def invoke_model(self, **kwargs):
+                request = json.loads(kwargs["body"].decode("utf-8"))
+                dimension = request.get("dimensions", 1024)
+                response = {
+                    "embedding": [1.0] * dimension,
+                    "inputTextTokenCount": len(request["inputText"]),
+                }
+                return {"body": io.BytesIO(json.dumps(response).encode())}
 
         with tempfile.TemporaryDirectory() as directory:
             result = generate_embeddings(
                 self.frame,
                 split="train",
-                provider="sagemaker",
-                model="jp-embedding-v1",
-                endpoint_name="competition-embedding-endpoint",
+                provider="bedrock",
+                model="amazon.titan-embed-text-v2:0",
                 region_name="ap-northeast-1",
-                adapter_id="json-inputs-v1",
+                adapter_id="titan-text-embeddings-v2-v1",
                 output_root=directory,
-                embedding_dim=3,
+                embedding_dim=256,
                 batch_size=2,
                 dry_run=False,
                 client=RuntimeClient(),
                 show_progress=False,
             )
-            self.assertEqual(result["embeddings"].shape, (5, 3))
+            self.assertEqual(result["embeddings"].shape, (5, 256))
             config = json.loads(
                 (result["cache_dir"] / "config.json").read_text(encoding="utf-8")
             )
             provider_config = config["provider_config"]
+            self.assertEqual(provider_config["region_name"], "ap-northeast-1")
             self.assertEqual(
-                provider_config["endpoint_name"], "competition-embedding-endpoint"
+                provider_config["adapter_id"], "titan-text-embeddings-v2-v1"
             )
-            self.assertEqual(provider_config["adapter_id"], "json-inputs-v1")
+            self.assertEqual(config["model"], "amazon.titan-embed-text-v2:0")
 
-    def test_sagemaker_invoke_options_require_explicit_cache_identity(self):
+    def test_bedrock_invoke_options_require_explicit_cache_identity(self):
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(ValueError, "sagemaker_cache_identity"):
+            with self.assertRaisesRegex(ValueError, "bedrock_cache_identity"):
                 generate_embeddings(
                     self.frame,
                     split="train",
-                    provider="sagemaker",
-                    model="jp-embedding-v1",
+                    provider="bedrock",
+                    model="amazon.titan-embed-text-v2:0",
                     output_root=directory,
                     dry_run=True,
-                    invoke_endpoint_kwargs={"TargetVariant": "variant-b"},
+                    invoke_model_kwargs={"performanceConfigLatency": "optimized"},
                     show_progress=False,
                 )
 
@@ -168,10 +210,10 @@ class EmbeddingFeatureTests(unittest.TestCase):
             result = generate_embeddings(
                 self.frame,
                 split="train",
-                provider="sagemaker",
-                model="jp-embedding-v1",
+                provider="bedrock",
+                model="amazon.titan-embed-text-v2:0",
                 output_root=directory,
-                embedding_dim=3,
+                embedding_dim=256,
                 dry_run=True,
                 embedder=must_not_run,
                 show_progress=False,
@@ -190,8 +232,8 @@ class EmbeddingFeatureTests(unittest.TestCase):
             result = generate_embeddings(
                 self.frame,
                 split="train",
-                provider="sagemaker",
-                model="jp-embedding-v1",
+                provider="bedrock",
+                model="amazon.titan-embed-text-v2:0",
                 output_root=directory,
                 embedding_dim=3,
                 batch_size=2,
@@ -235,8 +277,8 @@ class EmbeddingFeatureTests(unittest.TestCase):
             cached = generate_embeddings(
                 self.frame,
                 split="train",
-                provider="sagemaker",
-                model="jp-embedding-v1",
+                provider="bedrock",
+                model="amazon.titan-embed-text-v2:0",
                 output_root=directory,
                 embedding_dim=3,
                 batch_size=2,
@@ -259,8 +301,8 @@ class EmbeddingFeatureTests(unittest.TestCase):
             first = generate_embeddings(
                 self.frame,
                 split="train",
-                provider="sagemaker",
-                model="jp-embedding-v1",
+                provider="bedrock",
+                model="amazon.titan-embed-text-v2:0",
                 output_root=directory,
                 embedding_dim=3,
                 batch_size=5,
@@ -275,8 +317,8 @@ class EmbeddingFeatureTests(unittest.TestCase):
                 generate_embeddings(
                     changed,
                     split="train",
-                    provider="sagemaker",
-                    model="jp-embedding-v1",
+                    provider="bedrock",
+                    model="amazon.titan-embed-text-v2:0",
                     output_root=directory,
                     embedding_dim=3,
                     batch_size=5,
@@ -301,8 +343,8 @@ class EmbeddingFeatureTests(unittest.TestCase):
                 generate_embeddings(
                     self.frame,
                     split="train",
-                    provider="sagemaker",
-                    model="jp-embedding-v1",
+                    provider="bedrock",
+                    model="amazon.titan-embed-text-v2:0",
                     output_root=directory,
                     embedding_dim=3,
                     batch_size=2,
@@ -322,8 +364,8 @@ class EmbeddingFeatureTests(unittest.TestCase):
             resumed = generate_embeddings(
                 self.frame,
                 split="train",
-                provider="sagemaker",
-                model="jp-embedding-v1",
+                provider="bedrock",
+                model="amazon.titan-embed-text-v2:0",
                 output_root=directory,
                 embedding_dim=3,
                 batch_size=2,
@@ -343,8 +385,8 @@ class EmbeddingFeatureTests(unittest.TestCase):
                 generate_embeddings(
                     self.frame,
                     split="train",
-                    provider="sagemaker",
-                    model="jp-embedding-v1",
+                    provider="bedrock",
+                    model="amazon.titan-embed-text-v2:0",
                     output_root=directory,
                     text_cols=["project_name", "science_tech_decision"],
                     dry_run=True,

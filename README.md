@@ -23,7 +23,7 @@ competition/
 │   ├── test_modeling.py
 │   └── test_ensemble.py
 ├── requirements.txt
-├── embedding_features.py      # SageMaker Embedding endpoint・resume・保存
+├── embedding_features.py      # Amazon Bedrock Embedding・resume・保存
 ├── ensemble.py                # AUC hill climbing・test blend・submission
 ├── modeling.py                # E1〜E6 / T1〜T3の統一比較
 ├── text_features.py           # char TF-IDF・Logistic Regression
@@ -185,22 +185,23 @@ data/csv/
 
 CSVは非常に大きくなる可能性があります。`feature_output_dir=None`にすると保存を無効化できます。
 
-## SageMaker Embedding endpoint
+## Amazon Bedrock Embedding
 
-`embedding_features.py`はAmazon SageMaker Runtimeのreal-time endpointを呼び出し、生成物を`data/embeddings/`へ保存します。認証にはboto3の標準credential chainを使用します。SageMaker Notebook/Studio上ではexecution role、ローカルではAWS profileなどを利用し、Access keyをNotebookや設定ファイルへ直接書きません。
+`embedding_features.py`はAmazon Bedrock Runtimeの`InvokeModel`を呼び出し、生成物を`data/embeddings/`へ保存します。認証にはboto3の標準credential chainを使用します。AWS上ではexecution role、ローカルではAWS profileなどを利用し、Access keyをNotebookや設定ファイルへ直接書きません。実行roleには対象modelへの`bedrock:InvokeModel`権限が必要です。
+
+API引数は[AWS公式Boto3 InvokeModel](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-runtime/client/invoke_model.html)、既定payloadは[AWS公式Titan Text Embeddings request/response](https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-titan-embed-text.html)に合わせています。
 
 ```powershell
-$env:SAGEMAKER_ENDPOINT_NAME="competition-embedding-endpoint"
 $env:AWS_DEFAULT_REGION="ap-northeast-1"
 # ローカルでnamed profileを使う場合のみ
 $env:AWS_PROFILE="your-profile"
 ```
 
-最初に`notebooks/03_generate_embeddings.ipynb`のdry-runで、行数、文字数、推定token、truncate候補を確認します。dry-runではboto3 clientもendpointも呼び出しません。少量の疎通確認は`RUN_SMOKE_API`、全件生成は`RUN_FULL_API`を明示的に`True`へ変更した場合だけ実行します。
+最初に`notebooks/03_generate_embeddings.ipynb`のdry-runで、行数、文字数、推定token、truncate候補を確認します。dry-runではboto3 clientもBedrockも呼び出しません。少量の疎通確認は`RUN_SMOKE_API`、全件生成は`RUN_FULL_API`を明示的に`True`へ変更した場合だけ実行します。
 
 ```text
 data/embeddings/
-└── sagemaker_jp-embedding-v1_dimdefault_<config-hash>/
+└── bedrock_amazon.titan-embed-text-v2_0_dim1024_<config-hash>/
     ├── config.json
     ├── train_embeddings.npy
     ├── train_metadata.parquet
@@ -211,14 +212,14 @@ data/embeddings/
     └── shards/
 ```
 
-batchごとにshardを保存するため、中断後は取得済みbatchを再利用して続きから再開します。endpoint、model識別名、dimension、adapter ID、使用列、template、正規化、text hashが一致しないcacheは再利用しません。`EMBEDDING_DIM=None`なら最初のresponseから次元を解決します。
+batchごとにshardを保存するため、中断後は取得済みbatchを再利用して続きから再開します。model ID、region、dimension、adapter ID、使用列、template、正規化、text hashが一致しないcacheは再利用しません。`EMBEDDING_DIM=None`なら最初のresponseから次元を解決します。
 
-SageMaker endpointの入出力仕様はモデルcontainerによって異なるため、次の2つを差し替え可能にしています。
+Bedrockはmodelごとに入出力仕様が異なるため、次の2つを差し替え可能にしています。
 
-- `request_builder(texts, model, embedding_dim)`: `bytes`、文字列、またはJSON化可能なdictを返す
-- `response_parser(body, expected_rows)`: response bodyから2次元`float32`互換行列を返す
+- `request_builder(text, model, embedding_dim)`: 1件のtextから`bytes`、文字列、またはJSON化可能なdictを返す
+- `response_parser(body)`: response bodyから1次元`float32`互換vectorを返す
 
-既定adapterは`{"inputs": [...]}`を送り、`embeddings`、`vectors`、`predictions`、OpenAI風`data[].embedding`、または直接2次元配列を読み取ります。仕様を変更したときは`adapter_id`も更新してください。これにより、異なるpayload/parserで作ったcacheを誤って再利用しません。
+既定adapterはAmazon Titan Text Embeddings V2用です。`inputText`、`dimensions`、`normalize=true`を送り、`embedding`と`inputTextTokenCount`を読み取ります。Titan V2は1リクエスト1テキストなので、checkpoint batch内でも1件ずつ`InvokeModel`を呼び、リトライも1件単位です。model・payload・parserを変更したときは`adapter_id`も更新してください。
 
 ```python
 from embedding_features import generate_embeddings
@@ -226,45 +227,43 @@ from embedding_features import generate_embeddings
 result = generate_embeddings(
     df=train,
     split="train",
-    provider="sagemaker",
-    model="jp-embedding-v1",  # endpoint内モデルのcache識別名
-    endpoint_name="competition-embedding-endpoint",
+    provider="bedrock",
+    model="amazon.titan-embed-text-v2:0",
     region_name="ap-northeast-1",
-    embedding_dim=None,
+    embedding_dim=1024,
     output_root="data/embeddings",
-    dry_run=True,  # boto3 clientもendpointも呼ばない
+    dry_run=True,  # boto3 clientもBedrockも呼ばない
 )
 ```
 
-API contractが例えば`sentences/result`形式に決まった場合は、Notebook側だけで次のように変更できます。
+別のBedrock modelやimported modelが`sentence/result`形式の場合は、Notebook側だけで次のように変更できます。
 
 ```python
 import json
 import numpy as np
 
-def request_builder(texts, model, embedding_dim):
-    return {"sentences": list(texts), "parameters": {"dimension": embedding_dim}}
+def request_builder(text, model, embedding_dim):
+    return {"sentence": text, "parameters": {"dimension": embedding_dim}}
 
-def response_parser(body, expected_rows):
+def response_parser(body):
     payload = json.loads(body.decode("utf-8"))
-    matrix = np.asarray(payload["result"], dtype=np.float32)
-    assert matrix.shape[0] == expected_rows
-    return matrix
+    vector = np.asarray(payload["result"], dtype=np.float32)
+    assert vector.ndim == 1
+    return vector
 
 result = generate_embeddings(
     df=train,
     split="train",
-    provider="sagemaker",
-    model="jp-embedding-v1",
-    endpoint_name="competition-embedding-endpoint",
+    provider="bedrock",
+    model="your-model-id-or-arn",
     request_builder=request_builder,
     response_parser=response_parser,
-    adapter_id="sentences-result-v1",
+    adapter_id="sentence-result-v1",
     dry_run=False,
 )
 ```
 
-`TargetVariant`や`InferenceComponentName`などを渡す場合は`invoke_endpoint_kwargs`を使用できます。その値が出力モデルを変える場合は、秘密情報を含まない`sagemaker_cache_identity`にも対応する識別情報を入れてcache fingerprintへ反映してください。SageMakerは通常instance稼働時間で課金されるため、token単価ベースの予算guardは既定0で、endpoint料金はAWS側で別途確認します。
+`performanceConfigLatency`、guardrail、service tierなどを渡す場合は`invoke_model_kwargs`を使用できます。kwargsを指定した場合は、秘密情報を含まない`bedrock_cache_identity`にも対応する識別情報を必ず入れてcache fingerprintへ反映します。料金はmodelとregionで異なるため、実行直前に現行の入力token単価を`price_per_million_tokens`へ明示設定します。
 
 ## Embedding + Tabular + TF-IDFの9実験
 

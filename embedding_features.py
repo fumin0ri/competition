@@ -1,8 +1,7 @@
 """Generate, checkpoint, validate, and load text embeddings.
 
-The primary runtime is an Amazon SageMaker real-time endpoint. Request and
-response adapters are injectable because the endpoint contract may differ by
-the model container used by the competition team.
+The primary runtime is Amazon Bedrock ``InvokeModel``. Request and response
+adapters are injectable because Bedrock payloads differ by model provider.
 """
 
 from __future__ import annotations
@@ -28,12 +27,12 @@ Embedder: TypeAlias = Callable[
     [Sequence[str], Any, str, int | None],
     tuple[np.ndarray, Mapping[str, int]],
 ]
-SageMakerRequestBuilder: TypeAlias = Callable[
-    [Sequence[str], str, int | None],
+BedrockRequestBuilder: TypeAlias = Callable[
+    [str, str, int | None],
     bytes | str | Mapping[str, Any],
 ]
-SageMakerResponseParser: TypeAlias = Callable[
-    [bytes, int],
+BedrockResponseParser: TypeAlias = Callable[
+    [bytes],
     np.ndarray | tuple[np.ndarray, Mapping[str, int]],
 ]
 
@@ -54,10 +53,9 @@ DEFAULT_TEXT_TEMPLATE = (
 # pages immediately before a paid run. Defaults reflect standard paid text
 # input pricing checked on 2026-08-24.
 DEFAULT_PRICE_PER_MILLION_TOKENS = {
-    # SageMaker endpoints are normally billed by instance uptime rather than
-    # request tokens. Keep zero as the safe default; an internal chargeback
-    # estimate can be supplied explicitly when needed.
-    "sagemaker": 0.0,
+    # Bedrock price depends on the selected model and can change. Keep zero as
+    # the safe default and require an explicit current price for cost estimates.
+    "bedrock": 0.0,
     "openai": 0.13,  # text-embedding-3-large
     "gemini": 0.20,  # gemini-embedding-2
 }
@@ -202,10 +200,10 @@ def _prepare_inputs(
             prepared.append(text)
             token_counts.append(len(tokens))
             truncated.append(was_truncated)
-    elif provider in {"gemini", "sagemaker"}:
+    elif provider in {"gemini", "bedrock"}:
         # These providers do not expose a model-independent local tokenizer.
         # Use a configurable character estimate and truncate locally; a custom
-        # SageMaker request builder may add a provider-side truncation option.
+        # Bedrock request builder may add a model-specific truncation option.
         character_limit = max(1, int(max_input_tokens * gemini_chars_per_token))
         for text in provider_texts:
             estimated = max(1, math.ceil(len(text) / gemini_chars_per_token))
@@ -219,7 +217,7 @@ def _prepare_inputs(
             )
             truncated.append(was_truncated)
     else:
-        raise ValueError("provider must be 'sagemaker', 'openai', or 'gemini'.")
+        raise ValueError("provider must be 'bedrock', 'openai', or 'gemini'.")
 
     details = pd.DataFrame(
         {
@@ -268,139 +266,163 @@ def create_gemini_client() -> Any:
     return genai.Client(api_key=api_key)
 
 
-def create_sagemaker_runtime_client(
+def create_bedrock_runtime_client(
     region_name: str | None = None,
     profile_name: str | None = None,
 ) -> Any:
-    """Create a SageMaker Runtime client using the standard AWS credential chain.
+    """Create a Bedrock Runtime client using the standard AWS credential chain.
 
     Credentials are never accepted as arguments. Locally, boto3 can use an AWS
-    profile; on SageMaker it normally obtains temporary credentials from the
-    execution role automatically.
+    profile; on an AWS managed notebook it normally obtains temporary
+    credentials from the execution role automatically.
     """
     try:
         import boto3
     except ImportError as error:
-        raise ImportError("Install the boto3 package to invoke SageMaker.") from error
+        raise ImportError("Install the boto3 package to invoke Amazon Bedrock.") from error
     session = boto3.Session(profile_name=profile_name, region_name=region_name)
-    return session.client("sagemaker-runtime")
+    return session.client("bedrock-runtime")
 
 
-def build_sagemaker_json_request(
-    texts: Sequence[str],
+def build_bedrock_titan_request(
+    text: str,
     model: str,
     embedding_dim: int | None,
 ) -> Mapping[str, Any]:
-    """Build the default Hugging Face-style JSON request.
+    """Build an Amazon Titan Text Embeddings V2 request.
 
-    ``model`` and ``embedding_dim`` are intentionally not sent: a SageMaker
-    endpoint already identifies its deployed model, and container-specific
-    parameters should be added in a custom request builder.
+    Titan accepts one non-empty ``inputText`` per ``InvokeModel`` call and
+    supports 1024, 512, or 256 output dimensions. A different Bedrock model
+    should supply its own request builder and response parser.
     """
-    del model, embedding_dim
-    return {"inputs": list(texts)}
+    del model
+    if embedding_dim not in {None, 1024, 512, 256}:
+        raise ValueError("Titan Text Embeddings V2 dimensions must be 1024, 512, or 256.")
+    request: dict[str, Any] = {
+        "inputText": text,
+        "normalize": True,
+        "embeddingTypes": ["float"],
+    }
+    if embedding_dim is not None:
+        request["dimensions"] = embedding_dim
+    return request
 
 
-def _json_response_to_matrix(payload: Any, expected_rows: int) -> np.ndarray:
-    candidate = payload
-    if isinstance(candidate, Mapping):
-        for key in ("embeddings", "vectors", "predictions"):
-            if key in candidate:
-                candidate = candidate[key]
-                break
-        else:
-            data = candidate.get("data")
-            if isinstance(data, Sequence) and not isinstance(data, (str, bytes)):
-                if all(isinstance(item, Mapping) and "embedding" in item for item in data):
-                    candidate = [item["embedding"] for item in data]
-
-    if (
-        isinstance(candidate, Sequence)
-        and not isinstance(candidate, (str, bytes))
-        and candidate
-        and all(isinstance(item, Mapping) and "embedding" in item for item in candidate)
-    ):
-        candidate = [item["embedding"] for item in candidate]
-
-    matrix = np.asarray(candidate, dtype=np.float32)
-    if matrix.ndim == 1 and expected_rows == 1:
-        matrix = matrix.reshape(1, -1)
-    if matrix.ndim != 2 or matrix.shape[0] != expected_rows:
-        raise ValueError(
-            "SageMaker response does not contain one embedding per input. "
-            "Provide a custom response_parser for this endpoint contract."
-        )
-    return matrix
-
-
-def parse_sagemaker_json_response(
+def parse_bedrock_titan_response(
     body: bytes,
-    expected_rows: int,
-) -> np.ndarray:
-    """Parse common JSON embedding response shapes from a SageMaker endpoint."""
+) -> tuple[np.ndarray, Mapping[str, int]]:
+    """Parse an Amazon Titan Text Embeddings V2 response."""
     try:
         payload = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError(
-            "SageMaker response is not valid UTF-8 JSON. Provide a custom "
-            "response_parser for this endpoint contract."
+            "Bedrock response is not valid UTF-8 JSON. Provide a custom "
+            "response_parser for the selected model."
         ) from error
-    return _json_response_to_matrix(payload, expected_rows)
+    if not isinstance(payload, Mapping):
+        raise ValueError("Titan response must be a JSON object.")
+    embedding = payload.get("embedding")
+    if embedding is None:
+        by_type = payload.get("embeddingsByType")
+        if isinstance(by_type, Mapping):
+            embedding = by_type.get("float")
+    vector = np.asarray(embedding, dtype=np.float32)
+    if vector.ndim != 1 or vector.size == 0:
+        raise ValueError(
+            "Titan response does not contain a one-dimensional float embedding."
+        )
+    usage = {"total_tokens": int(payload.get("inputTextTokenCount", 0) or 0)}
+    return vector, usage
 
 
-def embed_sagemaker(
+def embed_bedrock(
     texts: Sequence[str],
     client: Any,
     model: str,
     embedding_dim: int | None,
     *,
-    endpoint_name: str,
     content_type: str = "application/json",
     accept: str = "application/json",
-    request_builder: SageMakerRequestBuilder = build_sagemaker_json_request,
-    response_parser: SageMakerResponseParser = parse_sagemaker_json_response,
-    invoke_endpoint_kwargs: Mapping[str, Any] | None = None,
+    request_builder: BedrockRequestBuilder = build_bedrock_titan_request,
+    response_parser: BedrockResponseParser = parse_bedrock_titan_response,
+    invoke_model_kwargs: Mapping[str, Any] | None = None,
+    max_retries: int = 6,
+    initial_backoff_seconds: float = 1.0,
 ) -> tuple[np.ndarray, Mapping[str, int]]:
-    """Invoke one SageMaker endpoint batch through replaceable adapters."""
-    if not endpoint_name:
-        raise ValueError("endpoint_name is required for SageMaker invocation.")
-    extra = dict(invoke_endpoint_kwargs or {})
-    reserved = {"EndpointName", "Body", "ContentType", "Accept"}.intersection(extra)
+    """Create a batch by invoking a Bedrock embedding model once per text.
+
+    Bedrock embedding request schemas are model-specific. The default adapter
+    targets Titan Text Embeddings V2, whose native request contains one text.
+    Each invocation is retried independently so a transient failure does not
+    repeat already successful billable requests in the same checkpoint batch.
+    """
+    if not model:
+        raise ValueError("model must be a Bedrock model ID, inference profile, or ARN.")
+    extra = dict(invoke_model_kwargs or {})
+    reserved = {"modelId", "body", "contentType", "accept"}.intersection(extra)
     if reserved:
         raise ValueError(
-            f"invoke_endpoint_kwargs may not override reserved keys: {sorted(reserved)}"
+            f"invoke_model_kwargs may not override reserved keys: {sorted(reserved)}"
         )
 
-    request = request_builder(texts, model, embedding_dim)
-    if isinstance(request, Mapping):
-        body: bytes | str = json.dumps(request, ensure_ascii=False).encode("utf-8")
-    elif isinstance(request, (bytes, str)):
-        body = request
-    else:
-        raise TypeError("request_builder must return bytes, str, or a mapping.")
+    vectors: list[np.ndarray] = []
+    total_tokens = 0
+    for text in texts:
+        request = request_builder(text, model, embedding_dim)
+        if isinstance(request, Mapping):
+            body: bytes | str = json.dumps(request, ensure_ascii=False).encode("utf-8")
+        elif isinstance(request, (bytes, str)):
+            body = request
+        else:
+            raise TypeError("request_builder must return bytes, str, or a mapping.")
 
-    response = client.invoke_endpoint(
-        EndpointName=endpoint_name,
-        Body=body,
-        ContentType=content_type,
-        Accept=accept,
-        **extra,
-    )
-    response_body = response.get("Body") if isinstance(response, Mapping) else None
-    if response_body is None:
-        raise ValueError("SageMaker response does not contain Body.")
-    raw = response_body.read() if hasattr(response_body, "read") else response_body
-    if isinstance(raw, str):
-        raw = raw.encode("utf-8")
-    if not isinstance(raw, bytes):
-        raise TypeError("SageMaker response Body must be bytes, str, or a readable stream.")
+        def invoke_once() -> tuple[np.ndarray, Mapping[str, int]]:
+            response = client.invoke_model(
+                modelId=model,
+                body=body,
+                contentType=content_type,
+                accept=accept,
+                **extra,
+            )
+            response_body = response.get("body") if isinstance(response, Mapping) else None
+            if response_body is None:
+                raise ValueError("Bedrock response does not contain body.")
+            raw = response_body.read() if hasattr(response_body, "read") else response_body
+            if isinstance(raw, str):
+                raw = raw.encode("utf-8")
+            if not isinstance(raw, bytes):
+                raise TypeError(
+                    "Bedrock response body must be bytes, str, or a readable stream."
+                )
+            parsed = response_parser(raw)
+            if isinstance(parsed, tuple):
+                vector, usage = parsed
+            else:
+                vector, usage = parsed, {}
+            array = np.asarray(vector, dtype=np.float32)
+            if array.ndim == 2 and array.shape[0] == 1:
+                array = array[0]
+            if array.ndim != 1 or array.size == 0:
+                raise ValueError(
+                    "Bedrock response parser must return one one-dimensional embedding."
+                )
+            return array, usage
 
-    parsed = response_parser(raw, len(texts))
-    if isinstance(parsed, tuple):
-        matrix, usage = parsed
-    else:
-        matrix, usage = parsed, {}
-    return np.asarray(matrix, dtype=np.float32), usage
+        vector, usage = _call_with_retry(
+            invoke_once,
+            max_retries=max_retries,
+            initial_backoff_seconds=initial_backoff_seconds,
+        )
+        if vectors and vector.shape != vectors[0].shape:
+            raise ValueError("Embedding dimension changed within a Bedrock batch.")
+        vectors.append(vector)
+        total_tokens += int(usage.get("total_tokens", 0))
+
+    if not vectors:
+        return np.empty((0, embedding_dim or 0), dtype=np.float32), {"total_tokens": 0}
+    return np.vstack(vectors).astype(np.float32, copy=False), {
+        "total_tokens": total_tokens
+    }
 
 
 def list_embedding_models(provider: str, client: Any | None = None) -> list[str]:
@@ -415,13 +437,13 @@ def list_embedding_models(provider: str, client: Any | None = None) -> list[str]
             getattr(model, "name", "")
             for model in client.models.list()
         ]
-    elif provider == "sagemaker":
+    elif provider == "bedrock":
         raise ValueError(
-            "SageMaker uses a deployed endpoint name rather than a discoverable "
-            "embedding model catalog."
+            "Bedrock model availability is region/account specific. Configure the "
+            "model ID or inference profile explicitly."
         )
     else:
-        raise ValueError("provider must be 'sagemaker', 'openai', or 'gemini'.")
+        raise ValueError("provider must be 'bedrock', 'openai', or 'gemini'.")
     return sorted(model_id for model_id in model_ids if "embed" in model_id.lower())
 
 
@@ -515,7 +537,18 @@ def _is_retryable(error: Exception) -> bool:
     if status is not None:
         return status in {408, 409, 429, 500, 502, 503, 504}
     name = type(error).__name__.lower()
-    return any(word in name for word in ("timeout", "connection", "temporar"))
+    return any(
+        word in name
+        for word in (
+            "timeout",
+            "connection",
+            "temporar",
+            "throttl",
+            "modelnotready",
+            "serviceunavailable",
+            "internalserver",
+        )
+    )
 
 
 def _call_with_retry(
@@ -699,8 +732,8 @@ def _print_dry_run(report: Mapping[str, Any]) -> None:
     print("Embedding dry run (API is not called)")
     for key, value in report.items():
         print(f"{key}: {value}")
-    if report.get("provider") == "sagemaker":
-        print("SageMaker endpoint instance cost is not represented by the token estimate.")
+    if report.get("provider") == "bedrock":
+        print("Set a current model-specific token price to enable a cost estimate.")
     else:
         print("Verify price_per_million_tokens against the official pricing page before running.")
 
@@ -715,7 +748,7 @@ def generate_embeddings(
     text_template: str | None = DEFAULT_TEXT_TEMPLATE,
     project_id_col: str = "project_id",
     target_col: str = "science_tech_decision",
-    embedding_dim: int | None = 1536,
+    embedding_dim: int | None = 1024,
     batch_size: int = 32,
     max_retries: int = 6,
     initial_backoff_seconds: float = 1.0,
@@ -726,16 +759,15 @@ def generate_embeddings(
     dry_run: bool = True,
     client: Any | None = None,
     embedder: Embedder | None = None,
-    endpoint_name: str | None = None,
     region_name: str | None = None,
     aws_profile_name: str | None = None,
     content_type: str = "application/json",
     accept: str = "application/json",
-    request_builder: SageMakerRequestBuilder = build_sagemaker_json_request,
-    response_parser: SageMakerResponseParser = parse_sagemaker_json_response,
-    invoke_endpoint_kwargs: Mapping[str, Any] | None = None,
-    adapter_id: str = "json-inputs-v1",
-    sagemaker_cache_identity: Mapping[str, Any] | None = None,
+    request_builder: BedrockRequestBuilder = build_bedrock_titan_request,
+    response_parser: BedrockResponseParser = parse_bedrock_titan_response,
+    invoke_model_kwargs: Mapping[str, Any] | None = None,
+    adapter_id: str = "titan-text-embeddings-v2-v1",
+    bedrock_cache_identity: Mapping[str, Any] | None = None,
     show_progress: bool = True,
 ) -> dict[str, Any]:
     """Generate resumable embeddings and save all artifacts below output_root.
@@ -744,16 +776,15 @@ def generate_embeddings(
     to an API. In dry-run mode no client is initialized and no API is called.
     """
     provider = provider.lower()
-    if provider not in {"sagemaker", "openai", "gemini"}:
-        raise ValueError("provider must be 'sagemaker', 'openai', or 'gemini'.")
-    if provider == "sagemaker":
-        endpoint_name = endpoint_name or os.environ.get("SAGEMAKER_ENDPOINT_NAME")
+    if provider not in {"bedrock", "openai", "gemini"}:
+        raise ValueError("provider must be 'bedrock', 'openai', or 'gemini'.")
+    if provider == "bedrock":
         if not adapter_id.strip():
             raise ValueError("adapter_id must be a non-empty cache version string.")
-        if invoke_endpoint_kwargs and not sagemaker_cache_identity:
+        if invoke_model_kwargs and not bedrock_cache_identity:
             raise ValueError(
-                "sagemaker_cache_identity is required when invoke_endpoint_kwargs "
-                "may change which model or variant produces the embeddings."
+                "bedrock_cache_identity is required when invoke_model_kwargs may "
+                "change how the embeddings are produced."
             )
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", split):
         raise ValueError("split may contain only letters, numbers, _, ., and -.")
@@ -803,10 +834,9 @@ def generate_embeddings(
         "estimated_cost_usd": estimated_cost,
         "max_budget_usd": max_budget_usd,
     }
-    if provider == "sagemaker":
+    if provider == "bedrock":
         report.update(
             {
-                "endpoint_name": endpoint_name,
                 "region_name": region_name,
                 "adapter_id": adapter_id,
             }
@@ -820,19 +850,14 @@ def generate_embeddings(
             "report": report,
             "from_cache": False,
         }
-    if provider == "sagemaker" and embedder is None and not endpoint_name:
-        raise ValueError(
-            "endpoint_name or SAGEMAKER_ENDPOINT_NAME is required when dry_run=False."
-        )
     provider_config: dict[str, Any] | None = None
-    if provider == "sagemaker":
+    if provider == "bedrock":
         provider_config = {
-            "endpoint_name": endpoint_name,
             "region_name": region_name,
             "content_type": content_type,
             "accept": accept,
             "adapter_id": adapter_id,
-            "cache_identity": dict(sagemaker_cache_identity or {}),
+            "cache_identity": dict(bedrock_cache_identity or {}),
         }
     config = _embedding_config(
         provider=provider,
@@ -888,9 +913,10 @@ def generate_embeddings(
             "Estimated cost exceeds configured budget. API processing was not started."
         )
 
+    embedder_handles_retries = False
     if client is None:
-        if provider == "sagemaker":
-            client = create_sagemaker_runtime_client(
+        if provider == "bedrock":
+            client = create_bedrock_runtime_client(
                 region_name=region_name,
                 profile_name=aws_profile_name,
             )
@@ -899,27 +925,29 @@ def generate_embeddings(
         else:
             client = create_gemini_client()
     if embedder is None:
-        if provider == "sagemaker":
-            def sagemaker_embedder(
+        if provider == "bedrock":
+            def bedrock_embedder(
                 batch_texts: Sequence[str],
                 runtime_client: Any,
                 selected_model: str,
                 selected_dimension: int | None,
             ) -> tuple[np.ndarray, Mapping[str, int]]:
-                return embed_sagemaker(
+                return embed_bedrock(
                     batch_texts,
                     runtime_client,
                     selected_model,
                     selected_dimension,
-                    endpoint_name=endpoint_name,
                     content_type=content_type,
                     accept=accept,
                     request_builder=request_builder,
                     response_parser=response_parser,
-                    invoke_endpoint_kwargs=invoke_endpoint_kwargs,
+                    invoke_model_kwargs=invoke_model_kwargs,
+                    max_retries=max_retries,
+                    initial_backoff_seconds=initial_backoff_seconds,
                 )
 
-            embedder = sagemaker_embedder
+            embedder = bedrock_embedder
+            embedder_handles_retries = True
         elif provider == "openai":
             embedder = embed_openai
         else:
@@ -957,13 +985,18 @@ def generate_embeddings(
         usage: Mapping[str, int] = {}
         if matrix is None:
             try:
-                matrix, usage = _call_with_retry(
-                    lambda: embedder(
+                if embedder_handles_retries:
+                    matrix, usage = embedder(
                         texts[start:stop], client, model, embedding_dim
-                    ),
-                    max_retries=max_retries,
-                    initial_backoff_seconds=initial_backoff_seconds,
-                )
+                    )
+                else:
+                    matrix, usage = _call_with_retry(
+                        lambda: embedder(
+                            texts[start:stop], client, model, embedding_dim
+                        ),
+                        max_retries=max_retries,
+                        initial_backoff_seconds=initial_backoff_seconds,
+                    )
             except Exception as error:
                 _append_failure_log(cache_dir, split, start, stop, error)
                 raise
@@ -986,8 +1019,11 @@ def generate_embeddings(
             )
 
         completed_rows += stop - start
-        provider_tokens += int(
-            usage.get("total_tokens", sum(details["estimated_tokens"].iloc[start:stop]))
+        reported_tokens = int(usage.get("total_tokens", 0) or 0)
+        provider_tokens += (
+            reported_tokens
+            if reported_tokens > 0
+            else int(details["estimated_tokens"].iloc[start:stop].sum())
         )
         progress = {
             "split": split,
@@ -1127,19 +1163,19 @@ __all__ = [
     "DEFAULT_TEXT_COLS",
     "DEFAULT_TEXT_TEMPLATE",
     "build_embedding_text",
-    "build_sagemaker_json_request",
+    "build_bedrock_titan_request",
     "create_gemini_client",
     "create_openai_client",
-    "create_sagemaker_runtime_client",
+    "create_bedrock_runtime_client",
     "embed_gemini",
     "embed_openai",
-    "embed_sagemaker",
+    "embed_bedrock",
     "generate_embeddings",
     "l2_normalize_embeddings",
     "list_embedding_models",
     "load_embeddings",
     "normalize_embedding_text",
-    "parse_sagemaker_json_response",
+    "parse_bedrock_titan_response",
     "text_sha256",
     "verify_embedding_alignment",
 ]
