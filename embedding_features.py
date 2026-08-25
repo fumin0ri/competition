@@ -42,11 +42,13 @@ DEFAULT_TEXT_COLS = [
     "project_name",
     "project_objective",
     "project_summary",
+    "current_issues",
 ]
 DEFAULT_TEXT_TEMPLATE = (
     "プロジェクト名:\n{project_name}\n\n"
     "目的:\n{project_objective}\n\n"
-    "概要:\n{project_summary}"
+    "概要:\n{project_summary}\n\n"
+    "現状の課題:\n{current_issues}"
 )
 
 # Prices are configurable and must be checked against the official pricing
@@ -333,6 +335,101 @@ def parse_bedrock_titan_response(
         )
     usage = {"total_tokens": int(payload.get("inputTextTokenCount", 0) or 0)}
     return vector, usage
+
+
+def build_bedrock_cohere_classification_request(
+    text: str,
+    model: str,
+    embedding_dim: int | None,
+) -> Mapping[str, Any]:
+    """Build a Cohere Embed v3 request for downstream classification.
+
+    Cohere Embed v3 on Bedrock has a fixed 1024-dimensional float output. The
+    shared Bedrock runner invokes the model once per text, so ``texts`` contains
+    exactly one item. ``truncate='END'`` retains the beginning of long project
+    descriptions and lets the service enforce its token boundary.
+    """
+    del model
+    if embedding_dim not in {None, 1024}:
+        raise ValueError("Cohere Embed v3 produces exactly 1024 dimensions.")
+    return {
+        "texts": [text],
+        "input_type": "classification",
+        "truncate": "END",
+    }
+
+
+def parse_bedrock_cohere_response(
+    body: bytes,
+) -> tuple[np.ndarray, Mapping[str, int]]:
+    """Parse one float embedding from a Cohere Embed v3 Bedrock response."""
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("Cohere response is not valid UTF-8 JSON.") from error
+    if not isinstance(payload, Mapping):
+        raise ValueError("Cohere response must be a JSON object.")
+    embeddings = payload.get("embeddings")
+    if isinstance(embeddings, Mapping):
+        embeddings = embeddings.get("float")
+    matrix = np.asarray(embeddings, dtype=np.float32)
+    if matrix.ndim != 2 or matrix.shape[0] != 1 or matrix.shape[1] == 0:
+        raise ValueError(
+            "Cohere response must contain exactly one non-empty float embedding."
+        )
+    return matrix[0], {"total_tokens": 0}
+
+
+def embed_bedrock_cohere(
+    texts: Sequence[str],
+    client: Any,
+    model: str,
+    embedding_dim: int | None,
+) -> tuple[np.ndarray, Mapping[str, int]]:
+    """Embed up to 96 classification texts in one Cohere Bedrock invocation."""
+    if not model:
+        raise ValueError("model must be a Cohere Bedrock model ID or ARN.")
+    if embedding_dim not in {None, 1024}:
+        raise ValueError("Cohere Embed v3 produces exactly 1024 dimensions.")
+    batch = list(texts)
+    if not 1 <= len(batch) <= 96:
+        raise ValueError("Cohere Embed v3 accepts between 1 and 96 texts per call.")
+    response = client.invoke_model(
+        modelId=model,
+        body=json.dumps(
+            {
+                "texts": batch,
+                "input_type": "classification",
+                "truncate": "END",
+            },
+            ensure_ascii=False,
+        ).encode("utf-8"),
+        contentType="application/json",
+        accept="application/json",
+    )
+    response_body = response.get("body") if isinstance(response, Mapping) else None
+    if response_body is None:
+        raise ValueError("Bedrock response does not contain body.")
+    raw = response_body.read() if hasattr(response_body, "read") else response_body
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8")
+    if not isinstance(raw, bytes):
+        raise TypeError("Cohere response body must be bytes, str, or a readable stream.")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("Cohere response is not valid UTF-8 JSON.") from error
+    embeddings = payload.get("embeddings") if isinstance(payload, Mapping) else None
+    if isinstance(embeddings, Mapping):
+        embeddings = embeddings.get("float")
+    matrix = np.asarray(embeddings, dtype=np.float32)
+    if matrix.ndim != 2 or matrix.shape[0] != len(batch) or matrix.shape[1] == 0:
+        raise ValueError("Cohere response embedding matrix does not match the request.")
+    if embedding_dim is not None and matrix.shape[1] != embedding_dim:
+        raise ValueError(
+            f"Cohere returned dimension {matrix.shape[1]}, expected {embedding_dim}."
+        )
+    return matrix, {"total_tokens": 0}
 
 
 def embed_bedrock(
@@ -1163,6 +1260,7 @@ __all__ = [
     "DEFAULT_TEXT_COLS",
     "DEFAULT_TEXT_TEMPLATE",
     "build_embedding_text",
+    "build_bedrock_cohere_classification_request",
     "build_bedrock_titan_request",
     "create_gemini_client",
     "create_openai_client",
@@ -1170,12 +1268,14 @@ __all__ = [
     "embed_gemini",
     "embed_openai",
     "embed_bedrock",
+    "embed_bedrock_cohere",
     "generate_embeddings",
     "l2_normalize_embeddings",
     "list_embedding_models",
     "load_embeddings",
     "normalize_embedding_text",
     "parse_bedrock_titan_response",
+    "parse_bedrock_cohere_response",
     "text_sha256",
     "verify_embedding_alignment",
 ]

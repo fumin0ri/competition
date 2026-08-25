@@ -14,7 +14,9 @@ competition/
 │   ├── 01_time_series_cv.ipynb
 │   ├── 02_char_tfidf_logreg.ipynb
 │   ├── 03_generate_embeddings.ipynb
-│   └── 04_embedding_models.ipynb
+│   ├── 04_embedding_models.ipynb
+│   ├── 05_cohere_embeddings_to_submission.ipynb
+│   └── 06_tfidf_svd_nonlinear.ipynb
 ├── outputs/                    # モデルOOF・評価・test予測（Git管理対象外）
 ├── tests/
 │   ├── test_validation.py
@@ -149,7 +151,7 @@ from text_features import (
 combined_result = cross_validate_text_columns(
     df=train,
     folds=folds,
-    text_cols=["project_name", "project_objective", "project_summary"],
+    text_cols=["project_name", "project_objective", "project_summary", "current_issues"],
     target_col="science_tech_decision",
     project_col="project_name",
     year_col="project_start_year",
@@ -309,7 +311,7 @@ T1〜T3のLRは、行数より特徴数が多い高次元疎行列を想定し�
 TF-IDF設定と生成特徴量の保存先もconfigから変更できます。
 
 ```python
-CONFIG["text_cols"] = ["project_name", "project_objective", "project_summary"]
+CONFIG["text_cols"] = ["project_name", "project_objective", "project_summary", "current_issues"]
 CONFIG["tfidf"]["max_features"] = 300_000
 CONFIG["tfidf_feature_output_dir"] = "data/csv/tfidf_shared"
 ```
@@ -317,6 +319,14 @@ CONFIG["tfidf_feature_output_dir"] = "data/csv/tfidf_shared"
 共有TF-IDF特徴は`data/csv/tfidf_shared/fold_<n>_year_<year>/`へlong形式の圧縮CSVとして一度だけ保存します。T3はdenseなEmbeddingをCSRへ変換するため、`fold_metrics`へ`n_nonzero`と`sparse_memory_mib`を記録します。
 
 前処理のimputer、scaler、OneHotEncoderとoptional PCAはfold trainingだけでfitします。OOFの古い年度は`NaN`のまま保持し、以下へ保存します。
+
+tabularを使うE2・E4・E5・E6・T2・T3には、`CONFIG["text_cols"]`の各列からtarget非依存の文字統計も追加します。NFKC正規化後の欠損、文字数、`log1p`文字数、行数、文数、数字・英字・ひらがな・カタカナ・漢字・句読点の比率、unique文字率に加え、全列の合計文字数、非空列数、主要列間の長さ比を生成します。すべて同じ行の値だけから決まり、年度やtargetによる集計は行いません。
+
+```python
+CONFIG["feature_engineering"]["add_text_statistics"] = True  # 既定
+```
+
+無効化してablation比較する場合は`False`へ変更します。`project_name`頻度やtarget encodingのように複数行を使う特徴は、この処理には含めていません。
 
 ```text
 outputs/
@@ -410,3 +420,60 @@ CONFIG["e6_pca_dims"] = [None, 512, 256]
 ```
 
 CatBoostのGPU学習は公式仕様上、同じseedでもbitwise deterministicではありません。厳密な再現性が必要な最終比較では`task_type="CPU"`も確認してください。
+
+## Cohere MultilingualでEmbeddingから提出まで
+
+`notebooks/05_cohere_embeddings_to_submission.ipynb`は、Amazon Bedrockの`cohere.embed-multilingual-v3`を使い、次を一続きで実行するNotebookです。
+
+1. train/testのdry-runと料金概算
+2. 5行のCohere API smoke test
+3. resumableなtrain/test Embedding生成または既存cache読込
+4. 同一時系列foldでE1〜E6 / T1〜T3を比較
+5. 年度重みを変えたROC-AUC hill climbing
+6. 全train再fitと複数submission作成
+
+Cohere Embed v3は分類用途として`input_type="classification"`、長文は`truncate="END"`を使います。出力は1024次元です。CohereのBedrock adapterは`embedding_features.py`に実装してあり、複数textを最大96件まで1 API callへまとめられます。Notebookの既定は32件/callです。単体テストでpayload、batch数、response shapeを検証しています。
+
+安全のため、初期状態では次の実行フラグがすべて`False`です。dry-runと料金を確認してから、上から順に有効化してください。
+
+```python
+RUN_SMOKE_API = True
+RUN_EMBEDDING_API = True
+RUN_CV = True
+RUN_ENSEMBLE = True
+RUN_FINAL_SUBMISSION = True
+```
+
+既存Embeddingを再利用するときはAPIフラグを無効にし、`EXISTING_COHERE_CACHE_DIR`へcache directoryを指定します。結果はTitanなどの既存実験と混ざらないよう、次へ保存します。
+
+```text
+outputs/cohere/
+├── oof_predictions.parquet
+├── experiment_summary.csv
+├── ensemble_profile_comparison.csv
+├── ensembles/<profile>/
+├── test_predictions/
+├── submissions/
+│   ├── submission_<profile>.csv
+│   └── submission_manifest.csv
+└── submission.csv
+```
+
+## TF-IDF SVD + MLP/XGBoost
+
+`notebooks/06_tfidf_svd_nonlinear.ipynb`は、保存済みのTitanまたはCohere Embeddingを選び、次の2実験を既存と同じ時系列foldで評価します。
+
+| ID | 入力 | モデル |
+|---|---|---|
+| S1 | char TF-IDF → TruncatedSVD + Embedding + tabular/text統計 | MLP |
+| S2 | char TF-IDF → TruncatedSVD + Embedding + tabular/text統計 | XGBoost |
+
+raw TF-IDFはCSRのまま保持し、各foldのtrainingだけでfitしたTruncatedSVDによって既定256次元へ圧縮します。TF-IDFとSVDはS1/S2で共有し、validationやtestはtransformだけに使います。MLPはAUC early stopping、XGBoostは`eval_metric="auc"`を使用します。
+
+```python
+CONFIG["tfidf_svd"]["n_components"] = 256
+RUN_CV = True
+RUN_FULL_TEST_PREDICTION = True  # CV確認後のみ
+```
+
+fold別およびfull-trainのSVD特徴は`data/csv/tfidf_svd_shared/`、OOF・metrics・個別test予測・submissionは`outputs/tfidf_svd_nonlinear/`へ保存します。指定次元を確保できないfoldでは自動縮小せず、設定変更を促すエラーにします。

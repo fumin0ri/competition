@@ -8,17 +8,21 @@ import numpy as np
 import pandas as pd
 
 from modeling import (
+    S1_TFIDF_SVD_MLP,
+    S2_TFIDF_SVD_XGB,
     _mlp_monitor_improved,
     _mlp_validation_statistics,
     build_experiment_summary,
     default_modeling_config,
     fit_full_and_predict_test,
+    fit_full_tfidf_svd_nonlinear_and_predict_test,
     prepare_tabular_features,
     run_all_experiments,
     run_e1_embedding_lr,
     run_e5_tabular_catboost,
     run_e6_embedding_tabular_xgboost,
     run_tfidf_lr_experiments,
+    run_tfidf_svd_nonlinear_experiments,
     validate_embedding_input,
 )
 from validation import make_time_series_cv
@@ -35,6 +39,9 @@ class ModelingTests(unittest.TestCase):
                     {
                         "project_id": f"p{position}",
                         "project_name": "継続事業" if target == 0 else f"新規{year}",
+                        "project_objective": f"目的{target}",
+                        "project_summary": f"概要{year}。詳細{target}",
+                        "current_issues": None if position == 2 else f"課題{target}",
                         "project_start_year": year,
                         "project_end_year": year + 2,
                         "project_fiscal_year": year,
@@ -75,6 +82,43 @@ class ModelingTests(unittest.TestCase):
         self.assertTrue(np.isnan(prepared.iloc[0]["project_duration"]))
         self.assertIn("log1p_budget", numeric)
         self.assertEqual(categorical, ["responsible_ministry"])
+
+    def test_text_statistics_are_deterministic_row_features(self):
+        frame = pd.DataFrame(
+            {
+                "project_name": ["ＡI\n研究。次!", None],
+                "project_objective": ["", "目的"],
+                "project_summary": [None, "概要です。"],
+                "current_issues": ["", "課題123"],
+            },
+            index=[10, 30],
+        )
+        prepared, numeric, categorical = prepare_tabular_features(
+            frame,
+            numeric_cols=[],
+            categorical_cols=[],
+            add_project_duration=False,
+            add_log1p_budget=False,
+            add_text_statistics=True,
+            text_cols=[
+                "project_name",
+                "project_objective",
+                "project_summary",
+                "current_issues",
+            ],
+        )
+        self.assertEqual(categorical, [])
+        self.assertEqual(prepared.loc[10, "project_name__char_count"], 8.0)
+        self.assertEqual(prepared.loc[10, "project_name__line_count"], 2.0)
+        self.assertEqual(prepared.loc[10, "project_name__sentence_count"], 2.0)
+        self.assertAlmostEqual(prepared.loc[10, "project_name__latin_ratio"], 0.25)
+        self.assertAlmostEqual(prepared.loc[10, "project_name__kanji_ratio"], 0.375)
+        self.assertAlmostEqual(
+            prepared.loc[10, "project_name__punctuation_ratio"], 0.25
+        )
+        self.assertEqual(prepared.loc[10, "text__nonempty_count"], 1.0)
+        self.assertAlmostEqual(prepared.loc[30, "current_issues__digit_ratio"], 0.6)
+        self.assertTrue(np.isfinite(prepared[numeric].to_numpy()).all())
 
     def test_embedding_alignment_rejects_reordered_metadata(self):
         reordered = self.metadata.iloc[::-1].reset_index(drop=True)
@@ -332,6 +376,175 @@ class ModelingTests(unittest.TestCase):
                 run_t3=True,
                 tfidf_feature_output_dir=None,
             )
+
+    def test_s1_s2_share_fold_tfidf_svd_and_preserve_oof_labels(self):
+        from text_features import fit_transform_tfidf_columns
+
+        class FakeXGBClassifier:
+            def __init__(self, **params):
+                self.params = params
+                self.best_iteration = 2
+
+            def fit(self, x, y, **kwargs):
+                del x, kwargs
+                self.probability = float(np.mean(y))
+                return self
+
+            def predict_proba(self, x):
+                positive = np.full(len(x), self.probability)
+                return np.column_stack([1 - positive, positive])
+
+        def fake_mlp(x_train, y_train, x_valid, y_valid, config, random_state):
+            del x_train, y_valid, config, random_state
+            prediction = np.full(len(x_valid), float(np.mean(y_train)), dtype=np.float32)
+            return prediction, {
+                "fit_seconds": 0.01,
+                "predict_seconds": 0.01,
+                "input_dim": x_valid.shape[1],
+                "device": "cpu",
+                "best_iteration": 1,
+                "early_stop_metric": "auc",
+                "best_validation_loss": 0.7,
+                "best_validation_auc": 0.5,
+            }
+
+        fake_module = types.ModuleType("xgboost")
+        fake_module.XGBClassifier = FakeXGBClassifier
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.dict("sys.modules", {"xgboost": fake_module}),
+                patch(
+                    "modeling.fit_transform_tfidf_columns",
+                    wraps=fit_transform_tfidf_columns,
+                ) as tfidf_transform,
+                patch(
+                    "modeling._fit_transform_tfidf_svd",
+                    wraps=__import__("modeling")._fit_transform_tfidf_svd,
+                ) as svd_transform,
+                patch("modeling._fit_predict_torch_mlp", side_effect=fake_mlp),
+            ):
+                results = run_tfidf_svd_nonlinear_experiments(
+                    self.train,
+                    self.folds,
+                    ["project_name"],
+                    self.embeddings,
+                    self.metadata,
+                    ["project_start_year", "budget"],
+                    ["responsible_ministry"],
+                    tfidf_config={"ngram_range": (2, 3), "min_df": 1},
+                    svd_config={"n_components": 2, "n_iter": 3},
+                    mlp_config={"device": "cpu"},
+                    xgboost_config={"device": "cpu", "n_estimators": 5},
+                    svd_feature_output_dir=directory,
+                )
+            self.assertEqual(tfidf_transform.call_count, len(self.folds))
+            self.assertEqual(svd_transform.call_count, len(self.folds))
+            self.assertTrue(
+                (Path(directory) / "fold_0_year_2020/train_svd_features.csv.gz").exists()
+            )
+        self.assertEqual(set(results), {S1_TFIDF_SVD_MLP, S2_TFIDF_SVD_XGB})
+        validation_labels = pd.Index(
+            np.concatenate([valid_idx.to_numpy() for _, valid_idx in self.folds])
+        )
+        old_labels = self.train.index.difference(validation_labels)
+        for result in results.values():
+            self.assertTrue(result.oof.loc[old_labels].isna().all())
+            self.assertTrue(result.oof.loc[validation_labels].notna().all())
+            self.assertEqual(result.fold_metrics["svd_dim"].tolist(), [2, 2, 2])
+            self.assertTrue(result.metadata["raw_tfidf_was_dense"] is False)
+
+    def test_svd_experiment_rejects_dimension_above_fold_limit(self):
+        with self.assertRaisesRegex(ValueError, "fold limit"):
+            run_tfidf_svd_nonlinear_experiments(
+                self.train,
+                self.folds,
+                ["project_name"],
+                self.embeddings,
+                self.metadata,
+                ["project_start_year", "budget"],
+                ["responsible_ministry"],
+                run_s1=True,
+                run_s2=False,
+                tfidf_config={"ngram_range": (2, 3), "min_df": 1},
+                svd_config={"n_components": 256},
+                svd_feature_output_dir=None,
+            )
+
+    def test_full_s1_s2_fit_train_only_and_predict_unknown_category(self):
+        from text_features import fit_transform_tfidf_columns
+
+        test = self.train.iloc[:3].drop(columns="target").copy()
+        test.index = [900, 901, 902]
+        test["project_id"] = ["t1", "t2", "t3"]
+        test["project_name"] = ["test only alpha", "test only beta", "test only gamma"]
+        test["responsible_ministry"] = "UNKNOWN_MINISTRY"
+        test_embeddings = self.embeddings[:3]
+        test_metadata = pd.DataFrame(
+            {
+                "split": "test",
+                "original_index": test.index,
+                "project_id": test["project_id"].to_numpy(),
+            }
+        )
+
+        class FakeXGBClassifier:
+            def __init__(self, **params):
+                self.params = params
+
+            def fit(self, x, y, **kwargs):
+                del x, kwargs
+                self.probability = float(np.mean(y))
+                return self
+
+            def predict_proba(self, x):
+                positive = np.full(len(x), self.probability)
+                return np.column_stack([1 - positive, positive])
+
+        def fake_mlp(x_train, y_train, x_valid, y_valid, config, random_state):
+            del x_train, y_valid, config, random_state
+            prediction = np.full(len(x_valid), float(np.mean(y_train)), dtype=np.float32)
+            return prediction, {}
+
+        fake_module = types.ModuleType("xgboost")
+        fake_module.XGBClassifier = FakeXGBClassifier
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.dict("sys.modules", {"xgboost": fake_module}),
+                patch(
+                    "modeling.fit_transform_tfidf_columns",
+                    wraps=fit_transform_tfidf_columns,
+                ) as transform,
+                patch("modeling._fit_predict_torch_mlp", side_effect=fake_mlp),
+            ):
+                predictions = fit_full_tfidf_svd_nonlinear_and_predict_test(
+                    self.train,
+                    test,
+                    [S1_TFIDF_SVD_MLP, S2_TFIDF_SVD_XGB],
+                    ["project_name"],
+                    self.embeddings,
+                    test_embeddings,
+                    self.metadata,
+                    test_metadata,
+                    ["project_start_year", "budget"],
+                    ["responsible_ministry"],
+                    config={
+                        "text_cols": ["project_name"],
+                        "tfidf": {"ngram_range": (2, 3), "min_df": 1},
+                        "tfidf_svd": {"n_components": 2, "n_iter": 3},
+                        "mlp": {"device": "cpu", "full_epochs": 1},
+                        "xgboost": {"device": "cpu", "n_estimators": 5},
+                    },
+                    svd_feature_output_dir=directory,
+                )
+            train_arg, test_arg = transform.call_args.args[:2]
+            self.assertTrue(train_arg.index.equals(self.train.index))
+            self.assertTrue(test_arg.index.equals(test.index))
+            self.assertTrue((Path(directory) / "train_svd_features.csv.gz").exists())
+            self.assertTrue((Path(directory) / "test_svd_features.csv.gz").exists())
+        self.assertEqual(set(predictions), {S1_TFIDF_SVD_MLP, S2_TFIDF_SVD_XGB})
+        for prediction in predictions.values():
+            self.assertEqual(prediction.shape, (3,))
+            self.assertTrue(((prediction >= 0) & (prediction <= 1)).all())
 
     def test_run_all_adds_t1_t2_t3_to_unified_oof(self):
         with tempfile.TemporaryDirectory() as directory:

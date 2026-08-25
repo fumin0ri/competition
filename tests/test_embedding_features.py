@@ -8,12 +8,15 @@ import numpy as np
 import pandas as pd
 
 from embedding_features import (
+    build_bedrock_cohere_classification_request,
     build_embedding_text,
     embed_bedrock,
+    embed_bedrock_cohere,
     generate_embeddings,
     l2_normalize_embeddings,
     load_embeddings,
     normalize_embedding_text,
+    parse_bedrock_cohere_response,
 )
 
 
@@ -25,6 +28,7 @@ class EmbeddingFeatureTests(unittest.TestCase):
                 "project_name": ["宇宙  開発", None, "量子", "海洋", "AI"],
                 "project_objective": ["目的A", "", "目的C", "目的D", "目的E"],
                 "project_summary": ["概要A", None, "概要C", "概要D", "概要E"],
+                "current_issues": ["課題A", None, "課題C", "課題D", "課題E"],
                 "science_tech_decision": [1, 0, 1, 0, 1],
             },
             index=[10, 20, 30, 40, 50],
@@ -45,7 +49,12 @@ class EmbeddingFeatureTests(unittest.TestCase):
     def test_normalization_and_empty_text(self):
         self.assertEqual(normalize_embedding_text("ＡＢＣ\n  １２３"), "ABC 123")
         empty = pd.Series(
-            {"project_name": None, "project_objective": " ", "project_summary": np.nan}
+            {
+                "project_name": None,
+                "project_objective": " ",
+                "project_summary": np.nan,
+                "current_issues": "",
+            }
         )
         self.assertEqual(build_embedding_text(empty), "[EMPTY]")
 
@@ -150,6 +159,57 @@ class EmbeddingFeatureTests(unittest.TestCase):
         self.assertEqual(usage["total_tokens"], 14)
         self.assertEqual(runtime.request["parameters"]["dimension"], 2)
         self.assertEqual(runtime.kwargs["performanceConfigLatency"], "optimized")
+
+    def test_bedrock_cohere_classification_adapter(self):
+        request = build_bedrock_cohere_classification_request(
+            "日本語のプロジェクト",
+            "cohere.embed-multilingual-v3",
+            1024,
+        )
+        self.assertEqual(request["texts"], ["日本語のプロジェクト"])
+        self.assertEqual(request["input_type"], "classification")
+        self.assertEqual(request["truncate"], "END")
+
+        vector, usage = parse_bedrock_cohere_response(
+            json.dumps({"embeddings": [[1.0, 2.0, 3.0]]}).encode("utf-8")
+        )
+        np.testing.assert_allclose(vector, [1.0, 2.0, 3.0])
+        self.assertEqual(usage, {"total_tokens": 0})
+
+    def test_bedrock_cohere_adapter_rejects_wrong_dimension_and_batch_response(self):
+        with self.assertRaisesRegex(ValueError, "1024"):
+            build_bedrock_cohere_classification_request(
+                "text", "cohere.embed-multilingual-v3", 512
+            )
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            parse_bedrock_cohere_response(
+                json.dumps({"embeddings": [[1.0], [2.0]]}).encode("utf-8")
+            )
+
+    def test_bedrock_cohere_batches_multiple_texts_in_one_invocation(self):
+        class RuntimeClient:
+            def __init__(self):
+                self.calls = []
+
+            def invoke_model(self, **kwargs):
+                self.calls.append(kwargs)
+                texts = json.loads(kwargs["body"].decode("utf-8"))["texts"]
+                response = {"embeddings": [[float(i), 1.0] for i in range(len(texts))]}
+                return {"body": io.BytesIO(json.dumps(response).encode("utf-8"))}
+
+        runtime = RuntimeClient()
+        matrix, usage = embed_bedrock_cohere(
+            ["one", "two", "three"],
+            runtime,
+            "cohere.embed-multilingual-v3",
+            None,
+        )
+        self.assertEqual(len(runtime.calls), 1)
+        self.assertEqual(matrix.shape, (3, 2))
+        self.assertEqual(usage, {"total_tokens": 0})
+        request = json.loads(runtime.calls[0]["body"].decode("utf-8"))
+        self.assertEqual(request["input_type"], "classification")
+        self.assertEqual(request["truncate"], "END")
 
     def test_bedrock_generate_uses_model_and_adapter_cache_identity(self):
         class RuntimeClient:

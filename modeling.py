@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 import math
 import random
+import re
 import time
+import unicodedata
 import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -16,14 +18,14 @@ import numpy as np
 import pandas as pd
 from scipy import sparse
 from sklearn.compose import ColumnTransformer
-from sklearn.decomposition import PCA
+from sklearn.decomposition import PCA, TruncatedSVD
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss, roc_auc_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler, normalize
 
-from embedding_features import verify_embedding_alignment
+from embedding_features import DEFAULT_TEXT_COLS, verify_embedding_alignment
 from text_features import fit_transform_tfidf_columns, save_sparse_features_csv
 from validation import make_seen_project_mask
 
@@ -73,6 +75,7 @@ def default_modeling_config() -> dict[str, Any]:
             "project_name",
             "project_objective",
             "project_summary",
+            "current_issues",
         ],
         "tfidf": {
             "analyzer": "char",
@@ -87,6 +90,11 @@ def default_modeling_config() -> dict[str, Any]:
             "max_iter": 3000,
             "solver": "liblinear",
             "dual": True,
+        },
+        "tfidf_svd": {
+            "n_components": 256,
+            "n_iter": 7,
+            "algorithm": "randomized",
         },
         "tfidf_feature_output_dir": "data/csv/tfidf_shared",
         "lr": {
@@ -137,6 +145,7 @@ def default_modeling_config() -> dict[str, Any]:
         "feature_engineering": {
             "add_project_duration": True,
             "add_log1p_budget": True,
+            "add_text_statistics": True,
             "budget_col": "budget",
             "invalid_year_value": -1,
         },
@@ -173,6 +182,18 @@ def _merge_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
         else:
             merged[key] = value
     return merged
+
+
+def _resolve_feature_config(
+    config: Mapping[str, Any],
+    target_col: str,
+) -> dict[str, Any]:
+    feature_config = dict(config["feature_engineering"])
+    text_cols = list(config.get("text_cols", DEFAULT_TEXT_COLS))
+    if target_col in text_cols:
+        raise ValueError("target_col must never be included in text statistic columns.")
+    feature_config["text_cols"] = text_cols
+    return feature_config
 
 
 def _validate_metric(metric: str) -> str:
@@ -243,6 +264,8 @@ def prepare_tabular_features(
     *,
     add_project_duration: bool = True,
     add_log1p_budget: bool = True,
+    add_text_statistics: bool = False,
+    text_cols: Sequence[str] | None = None,
     budget_col: str = "budget",
     invalid_year_value: int | float = -1,
 ) -> tuple[pd.DataFrame, list[str], list[str]]:
@@ -257,6 +280,9 @@ def prepare_tabular_features(
         required |= {"project_start_year", "project_end_year"}
     if add_log1p_budget:
         required.add(budget_col)
+    statistic_text_cols = list(dict.fromkeys(text_cols or []))
+    if add_text_statistics:
+        required.update(statistic_text_cols)
     missing = sorted(required - set(df.columns))
     if missing:
         raise KeyError(f"Missing tabular columns: {missing}")
@@ -291,6 +317,107 @@ def prepare_tabular_features(
         result["log1p_budget"] = np.log1p(budget.clip(lower=0))
         if "log1p_budget" not in numeric:
             numeric.append("log1p_budget")
+
+    if add_text_statistics and statistic_text_cols:
+        text_lengths: dict[str, pd.Series] = {}
+        for column in statistic_text_cols:
+            values = df[column].map(
+                lambda value: ""
+                if pd.isna(value)
+                else unicodedata.normalize("NFKC", str(value))
+            )
+            compact = values.str.replace(r"\s+", " ", regex=True).str.strip()
+            char_count = compact.str.len().astype(float)
+            text_lengths[column] = char_count
+            denominator = char_count.where(char_count.gt(0), 1.0)
+
+            features = {
+                f"{column}__is_empty": char_count.eq(0).astype(float),
+                f"{column}__char_count": char_count,
+                f"{column}__log1p_char_count": np.log1p(char_count),
+                f"{column}__line_count": values.map(
+                    lambda text: float(len(text.splitlines())) if text.strip() else 0.0
+                ),
+                f"{column}__sentence_count": compact.map(
+                    lambda text: float(
+                        sum(bool(part.strip()) for part in re.split(r"[。！？!?]+", text))
+                    )
+                ),
+                f"{column}__digit_ratio": compact.map(
+                    lambda text: float(sum(char.isdigit() for char in text))
+                )
+                / denominator,
+                f"{column}__latin_ratio": compact.map(
+                    lambda text: float(
+                        sum(char.isascii() and char.isalpha() for char in text)
+                    )
+                )
+                / denominator,
+                f"{column}__hiragana_ratio": compact.map(
+                    lambda text: float(sum("\u3040" <= char <= "\u309f" for char in text))
+                )
+                / denominator,
+                f"{column}__katakana_ratio": compact.map(
+                    lambda text: float(
+                        sum(
+                            "\u30a0" <= char <= "\u30ff"
+                            or "\uff65" <= char <= "\uff9f"
+                            for char in text
+                        )
+                    )
+                )
+                / denominator,
+                f"{column}__kanji_ratio": compact.map(
+                    lambda text: float(
+                        sum(
+                            "\u3400" <= char <= "\u4dbf"
+                            or "\u4e00" <= char <= "\u9fff"
+                            for char in text
+                        )
+                    )
+                )
+                / denominator,
+                f"{column}__punctuation_ratio": compact.map(
+                    lambda text: float(
+                        sum(unicodedata.category(char).startswith("P") for char in text)
+                    )
+                )
+                / denominator,
+                f"{column}__unique_char_ratio": compact.map(
+                    lambda text: float(len(set(text)))
+                )
+                / denominator,
+            }
+            for feature_name, feature_values in features.items():
+                result[feature_name] = feature_values.astype(float)
+                if feature_name not in numeric:
+                    numeric.append(feature_name)
+
+        length_frame = pd.DataFrame(text_lengths, index=df.index)
+        total_length = length_frame.sum(axis=1).astype(float)
+        cross_features: dict[str, pd.Series] = {
+            "text__total_char_count": total_length,
+            "text__log1p_total_char_count": np.log1p(total_length),
+            "text__nonempty_count": length_frame.gt(0).sum(axis=1).astype(float),
+        }
+        if "project_name" in text_lengths:
+            cross_features["text__name_to_total_length_ratio"] = (
+                text_lengths["project_name"] / total_length.where(total_length.gt(0), 1.0)
+            )
+        if {"project_summary", "project_objective"}.issubset(text_lengths):
+            cross_features["text__summary_to_objective_length_ratio"] = (
+                (text_lengths["project_summary"] + 1.0)
+                / (text_lengths["project_objective"] + 1.0)
+            )
+        if {"current_issues", "project_summary"}.issubset(text_lengths):
+            cross_features["text__issues_to_summary_length_ratio"] = (
+                (text_lengths["current_issues"] + 1.0)
+                / (text_lengths["project_summary"] + 1.0)
+            )
+        for feature_name, feature_values in cross_features.items():
+            result[feature_name] = feature_values.astype(float)
+            if feature_name not in numeric:
+                numeric.append(feature_name)
 
     return result, numeric, categorical
 
@@ -1580,6 +1707,445 @@ def run_tfidf_lr_experiments(
     }
 
 
+S1_TFIDF_SVD_MLP = "S1_tfidf_svd_embedding_tabular_mlp"
+S2_TFIDF_SVD_XGB = "S2_tfidf_svd_embedding_tabular_xgb"
+
+
+def _fit_transform_tfidf_svd(
+    train_features: sparse.csr_matrix,
+    transform_features: sparse.csr_matrix,
+    config: Mapping[str, Any],
+    random_state: int,
+) -> tuple[np.ndarray, np.ndarray, TruncatedSVD, float]:
+    """Fit TruncatedSVD on fold training TF-IDF without densifying raw TF-IDF."""
+    if not sparse.isspmatrix_csr(train_features) or not sparse.isspmatrix_csr(
+        transform_features
+    ):
+        raise TypeError("TruncatedSVD input must remain CSR sparse TF-IDF.")
+    n_components = int(config.get("n_components", 256))
+    maximum = min(train_features.shape[0] - 1, train_features.shape[1] - 1)
+    if n_components <= 0 or n_components > maximum:
+        raise ValueError(
+            f"tfidf_svd.n_components={n_components} exceeds fold limit {maximum}; "
+            "reduce n_components explicitly."
+        )
+    model = TruncatedSVD(
+        n_components=n_components,
+        algorithm=str(config.get("algorithm", "randomized")),
+        n_iter=int(config.get("n_iter", 7)),
+        random_state=random_state,
+    )
+    train_reduced = np.asarray(
+        model.fit_transform(train_features), dtype=np.float32
+    )
+    transform_reduced = np.asarray(
+        model.transform(transform_features), dtype=np.float32
+    )
+    if (
+        train_reduced.shape != (train_features.shape[0], n_components)
+        or transform_reduced.shape != (transform_features.shape[0], n_components)
+        or not np.isfinite(train_reduced).all()
+        or not np.isfinite(transform_reduced).all()
+    ):
+        raise ValueError("TruncatedSVD returned invalid dense features.")
+    explained = float(model.explained_variance_ratio_.sum())
+    return train_reduced, transform_reduced, model, explained
+
+
+def _save_svd_features_csv(
+    matrix: np.ndarray,
+    index: pd.Index,
+    output_path: str | Path,
+) -> Path:
+    values = np.asarray(matrix, dtype=np.float32)
+    if values.ndim != 2 or len(values) != len(index) or not np.isfinite(values).all():
+        raise ValueError("SVD features and row index are not aligned.")
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    columns = [f"svd_{position:03d}" for position in range(values.shape[1])]
+    frame = pd.DataFrame(values, columns=columns)
+    frame.insert(0, "row_index", pd.Index(index).to_numpy(copy=True))
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    frame.to_csv(temporary, index=False, compression="gzip")
+    temporary.replace(path)
+    return path
+
+
+def _svd_nonlinear_xgb_params(
+    config: Mapping[str, Any] | None,
+    random_state: int,
+) -> dict[str, Any]:
+    params = {
+        "n_estimators": 1000,
+        "learning_rate": 0.03,
+        "max_depth": 6,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "objective": "binary:logistic",
+        "eval_metric": "auc",
+        "early_stopping_rounds": 80,
+        "tree_method": "hist",
+        "device": "cuda",
+        "n_jobs": -1,
+        **dict(config or {}),
+    }
+    params["random_state"] = random_state
+    return params
+
+
+def run_tfidf_svd_nonlinear_experiments(
+    df: pd.DataFrame,
+    folds: Sequence[tuple[pd.Index, pd.Index]],
+    text_cols: Sequence[str],
+    embeddings: np.ndarray,
+    embedding_metadata: pd.DataFrame,
+    numeric_cols: Sequence[str],
+    categorical_cols: Sequence[str],
+    *,
+    run_s1: bool = True,
+    run_s2: bool = True,
+    target_col: str = "target",
+    project_col: str = "project_name",
+    project_id_col: str = "project_id",
+    year_col: str = "project_start_year",
+    metric: str = "roc_auc",
+    embedding_scaling: str = "l2",
+    tfidf_config: Mapping[str, Any] | None = None,
+    svd_config: Mapping[str, Any] | None = None,
+    mlp_config: Mapping[str, Any] | None = None,
+    xgboost_config: Mapping[str, Any] | None = None,
+    feature_config: Mapping[str, Any] | None = None,
+    svd_feature_output_dir: str | Path | None = "data/csv/tfidf_svd_shared",
+    random_state: int = 42,
+) -> dict[str, ExperimentResult]:
+    """Run shared fold-fitted TF-IDF/SVD features through MLP and XGBoost."""
+    enabled = {S1_TFIDF_SVD_MLP: bool(run_s1), S2_TFIDF_SVD_XGB: bool(run_s2)}
+    enabled_names = [name for name, should_run in enabled.items() if should_run]
+    if not enabled_names:
+        return {}
+    if not text_cols or len(set(text_cols)) != len(text_cols):
+        raise ValueError("text_cols must be non-empty and contain no duplicates.")
+    if target_col in text_cols:
+        raise ValueError("target_col must never be included in TF-IDF text_cols.")
+    missing = [
+        column
+        for column in [*text_cols, target_col, project_col, year_col]
+        if column not in df.columns
+    ]
+    if missing:
+        raise KeyError(f"Missing SVD experiment columns: {missing}")
+    metric = _validate_metric(metric)
+    _validate_binary_target(df[target_col], target_col)
+    embedding_matrix = validate_embedding_input(
+        df, embeddings, embedding_metadata, project_id_col, split="train"
+    )
+    table, numeric, categorical = prepare_tabular_features(
+        df, numeric_cols, categorical_cols, **dict(feature_config or {})
+    )
+    svd_settings = {"n_components": 256, "n_iter": 7, "algorithm": "randomized"}
+    svd_settings.update(dict(svd_config or {}))
+    mlp_settings = dict(mlp_config or {})
+    xgb_params = _svd_nonlinear_xgb_params(xgboost_config, random_state)
+    if run_s2:
+        try:
+            from xgboost import XGBClassifier
+        except ImportError as error:
+            raise ImportError("Install xgboost to run S2.") from error
+    else:
+        XGBClassifier = None  # type: ignore[assignment,misc]
+
+    oof = {
+        name: pd.Series(np.nan, index=df.index, dtype=float, name=name)
+        for name in enabled_names
+    }
+    records: dict[str, list[dict[str, Any]]] = {name: [] for name in enabled_names}
+    output_root = Path(svd_feature_output_dir) if svd_feature_output_dir else None
+
+    for fold_number, (train_idx, valid_idx) in enumerate(folds):
+        train_idx, valid_idx = pd.Index(train_idx), pd.Index(valid_idx)
+        train_positions = _positions_from_labels(df, train_idx)
+        valid_positions = _positions_from_labels(df, valid_idx)
+        if np.intersect1d(train_positions, valid_positions).size:
+            raise ValueError("Training and validation indices overlap.")
+        y_train = df.loc[train_idx, target_col].to_numpy(dtype=np.float32)
+        y_valid = df.loc[valid_idx, target_col].to_numpy(dtype=np.float32)
+        if np.unique(y_train).size < 2:
+            raise ValueError(f"Fold {fold_number} training target has only one class.")
+
+        preprocessing_started = time.perf_counter()
+        tfidf_train, tfidf_valid, _, _ = fit_transform_tfidf_columns(
+            df.loc[train_idx], df.loc[valid_idx], text_cols, tfidf_config
+        )
+        tfidf_train = _as_float32_csr(tfidf_train)
+        tfidf_valid = _as_float32_csr(tfidf_valid)
+        svd_train, svd_valid, _, explained = _fit_transform_tfidf_svd(
+            tfidf_train, tfidf_valid, svd_settings, random_state
+        )
+        emb_train, emb_valid, _ = _fit_transform_embeddings(
+            embedding_matrix[train_positions],
+            embedding_matrix[valid_positions],
+            embedding_scaling,
+        )
+        shared_seconds = time.perf_counter() - preprocessing_started
+        if output_root is not None:
+            validation_year = _fold_year(df, valid_idx, year_col)
+            fold_dir = output_root / f"fold_{fold_number}_year_{validation_year}"
+            _save_svd_features_csv(
+                svd_train, train_idx, fold_dir / "train_svd_features.csv.gz"
+            )
+            _save_svd_features_csv(
+                svd_valid, valid_idx, fold_dir / "valid_svd_features.csv.gz"
+            )
+
+        seen = make_seen_project_mask(
+            df=df, train_idx=train_idx, valid_idx=valid_idx, project_col=project_col
+        ).to_numpy(dtype=bool)
+        validation_year = _fold_year(df, valid_idx, year_col)
+
+        if run_s1:
+            started = time.perf_counter()
+            svd_scaler = StandardScaler()
+            scaled_svd_train = np.asarray(
+                svd_scaler.fit_transform(svd_train), dtype=np.float32
+            )
+            scaled_svd_valid = np.asarray(
+                svd_scaler.transform(svd_valid), dtype=np.float32
+            )
+            tabular = _make_tabular_preprocessor(
+                numeric, categorical, scale_numeric=True
+            )
+            tab_train = np.asarray(
+                tabular.fit_transform(table.loc[train_idx]), dtype=np.float32
+            )
+            tab_valid = np.asarray(
+                tabular.transform(table.loc[valid_idx]), dtype=np.float32
+            )
+            x_train = _combine_dense(scaled_svd_train, emb_train, tab_train)
+            x_valid = _combine_dense(scaled_svd_valid, emb_valid, tab_valid)
+            branch_preprocessing_seconds = time.perf_counter() - started
+            prediction, details = _fit_predict_torch_mlp(
+                x_train, y_train, x_valid, y_valid, mlp_settings, random_state
+            )
+            details["fit_seconds"] += shared_seconds + branch_preprocessing_seconds
+            branch_details = details
+            experiment = S1_TFIDF_SVD_MLP
+            oof[experiment].loc[valid_idx] = prediction
+            records[experiment].append(
+                _svd_nonlinear_fold_record(
+                    experiment, fold_number, validation_year, train_idx, valid_idx,
+                    y_valid, prediction, seen, metric, explained,
+                    int(svd_train.shape[1]), branch_details,
+                )
+            )
+
+        if run_s2:
+            started = time.perf_counter()
+            tabular = _make_tabular_preprocessor(
+                numeric, categorical, scale_numeric=False
+            )
+            tab_train = np.asarray(
+                tabular.fit_transform(table.loc[train_idx]), dtype=np.float32
+            )
+            tab_valid = np.asarray(
+                tabular.transform(table.loc[valid_idx]), dtype=np.float32
+            )
+            x_train = _combine_dense(svd_train, emb_train, tab_train)
+            x_valid = _combine_dense(svd_valid, emb_valid, tab_valid)
+            branch_preprocessing_seconds = time.perf_counter() - started
+            assert XGBClassifier is not None
+            model = XGBClassifier(**xgb_params)
+            started = time.perf_counter()
+            model.fit(x_train, y_train, eval_set=[(x_valid, y_valid)], verbose=False)
+            model_fit_seconds = time.perf_counter() - started
+            started = time.perf_counter()
+            prediction = np.asarray(model.predict_proba(x_valid)[:, 1], dtype=float)
+            predict_seconds = time.perf_counter() - started
+            experiment = S2_TFIDF_SVD_XGB
+            oof[experiment].loc[valid_idx] = prediction
+            branch_details = {
+                "fit_seconds": shared_seconds
+                + branch_preprocessing_seconds
+                + model_fit_seconds,
+                "predict_seconds": predict_seconds,
+                "input_dim": x_train.shape[1],
+                "device": str(xgb_params.get("device", "cpu")),
+                "best_iteration": getattr(model, "best_iteration", np.nan),
+                "early_stop_metric": "auc",
+                "best_validation_loss": np.nan,
+                "best_validation_auc": _safe_score(y_valid, prediction, "roc_auc"),
+            }
+            records[experiment].append(
+                _svd_nonlinear_fold_record(
+                    experiment, fold_number, validation_year, train_idx, valid_idx,
+                    y_valid, prediction, seen, metric, explained,
+                    int(svd_train.shape[1]), branch_details,
+                )
+            )
+
+    return {
+        name: ExperimentResult(
+            name=name,
+            oof=oof[name],
+            fold_metrics=pd.DataFrame(records[name]),
+            metadata={
+                "text_cols": list(text_cols),
+                "tfidf_config": dict(tfidf_config or {}),
+                "svd_config": svd_settings,
+                "raw_tfidf_was_dense": False,
+            },
+        )
+        for name in enabled_names
+    }
+
+
+def _svd_nonlinear_fold_record(
+    experiment: str,
+    fold_number: int,
+    validation_year: int,
+    train_idx: pd.Index,
+    valid_idx: pd.Index,
+    y_valid: np.ndarray,
+    prediction: Sequence[float],
+    seen: np.ndarray,
+    metric: str,
+    explained: float,
+    svd_dim: int,
+    details: Mapping[str, Any],
+) -> dict[str, Any]:
+    values = np.asarray(prediction, dtype=float)
+    if (
+        len(values) != len(valid_idx)
+        or not np.isfinite(values).all()
+        or ((values < 0) | (values > 1)).any()
+    ):
+        raise ValueError(f"{experiment} validation predictions are invalid.")
+    return {
+        "experiment": experiment,
+        "fold": fold_number,
+        "validation_year": validation_year,
+        "train_rows": len(train_idx),
+        "valid_rows": len(valid_idx),
+        "metric": metric,
+        "overall_score": _safe_score(y_valid, values, metric),
+        "seen_score": _safe_score(y_valid[seen], values[seen], metric),
+        "unseen_score": _safe_score(y_valid[~seen], values[~seen], metric),
+        "seen_ratio": float(seen.mean()) if len(seen) else float("nan"),
+        "seen_rows": int(seen.sum()),
+        "unseen_rows": int((~seen).sum()),
+        "svd_explained_variance": explained,
+        "svd_dim": svd_dim,
+        **dict(details),
+    }
+
+
+def fit_full_tfidf_svd_nonlinear_and_predict_test(
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    experiments: Sequence[str],
+    text_cols: Sequence[str],
+    train_embeddings: np.ndarray,
+    test_embeddings: np.ndarray,
+    train_embedding_metadata: pd.DataFrame,
+    test_embedding_metadata: pd.DataFrame,
+    numeric_cols: Sequence[str],
+    categorical_cols: Sequence[str],
+    *,
+    config: Mapping[str, Any] | None = None,
+    target_col: str = "target",
+    project_id_col: str = "project_id",
+    svd_feature_output_dir: str | Path | None = "data/csv/tfidf_svd_shared/full_train",
+) -> dict[str, np.ndarray]:
+    """Fit shared train-only TF-IDF/SVD and predict test for selected S1/S2."""
+    selected = list(dict.fromkeys(experiments))
+    supported = {S1_TFIDF_SVD_MLP, S2_TFIDF_SVD_XGB}
+    if not selected or not set(selected).issubset(supported):
+        raise ValueError(f"experiments must be a non-empty subset of {sorted(supported)}.")
+    cfg = _merge_config(config)
+    feature_config = _resolve_feature_config(cfg, target_col)
+    _validate_binary_target(train[target_col], target_col)
+    if target_col in text_cols:
+        raise ValueError("target_col must never be included in TF-IDF text_cols.")
+    train_matrix = validate_embedding_input(
+        train, train_embeddings, train_embedding_metadata, project_id_col, "train"
+    )
+    test_matrix = validate_embedding_input(
+        test, test_embeddings, test_embedding_metadata, project_id_col, "test"
+    )
+    y_train = train[target_col].to_numpy(dtype=np.float32)
+    tfidf_train, tfidf_test, _, _ = fit_transform_tfidf_columns(
+        train, test, text_cols, cfg["tfidf"]
+    )
+    tfidf_train, tfidf_test = _as_float32_csr(tfidf_train), _as_float32_csr(tfidf_test)
+    svd_train, svd_test, _, _ = _fit_transform_tfidf_svd(
+        tfidf_train, tfidf_test, cfg["tfidf_svd"], int(cfg["random_state"])
+    )
+    if svd_feature_output_dir is not None:
+        output_root = Path(svd_feature_output_dir)
+        _save_svd_features_csv(
+            svd_train, train.index, output_root / "train_svd_features.csv.gz"
+        )
+        _save_svd_features_csv(
+            svd_test, test.index, output_root / "test_svd_features.csv.gz"
+        )
+    emb_train, emb_test = _transform_embeddings_with_fitted(
+        train_matrix, test_matrix, str(cfg["embedding_scaling"])
+    )
+    train_table, numeric, categorical = prepare_tabular_features(
+        train, numeric_cols, categorical_cols, **feature_config
+    )
+    test_table, test_numeric, test_categorical = prepare_tabular_features(
+        test, numeric_cols, categorical_cols, **feature_config
+    )
+    if numeric != test_numeric or categorical != test_categorical:
+        raise ValueError("Train/test engineered tabular feature definitions differ.")
+
+    predictions: dict[str, np.ndarray] = {}
+    seed = int(cfg["random_state"])
+    if S1_TFIDF_SVD_MLP in selected:
+        svd_scaler = StandardScaler()
+        scaled_train = np.asarray(svd_scaler.fit_transform(svd_train), dtype=np.float32)
+        scaled_test = np.asarray(svd_scaler.transform(svd_test), dtype=np.float32)
+        tab_train, tab_test = _full_tabular_transform(
+            train_table, test_table, numeric, categorical, scale_numeric=True
+        )
+        mlp_config = dict(cfg["mlp"])
+        mlp_config["max_epochs"] = int(mlp_config.get("full_epochs", 30))
+        prediction, _ = _fit_predict_torch_mlp(
+            _combine_dense(scaled_train, emb_train, tab_train),
+            y_train,
+            _combine_dense(scaled_test, emb_test, tab_test),
+            None,
+            mlp_config,
+            seed,
+        )
+        predictions[S1_TFIDF_SVD_MLP] = prediction
+    if S2_TFIDF_SVD_XGB in selected:
+        try:
+            from xgboost import XGBClassifier
+        except ImportError as error:
+            raise ImportError("Install xgboost to run S2.") from error
+        tab_train, tab_test = _full_tabular_transform(
+            train_table, test_table, numeric, categorical, scale_numeric=False
+        )
+        params = _svd_nonlinear_xgb_params(cfg["xgboost"], seed)
+        params.pop("early_stopping_rounds", None)
+        model = XGBClassifier(**params)
+        model.fit(
+            _combine_dense(svd_train, emb_train, tab_train), y_train, verbose=False
+        )
+        predictions[S2_TFIDF_SVD_XGB] = model.predict_proba(
+            _combine_dense(svd_test, emb_test, tab_test)
+        )[:, 1]
+    for name, prediction in predictions.items():
+        values = np.asarray(prediction, dtype=np.float32).reshape(-1)
+        if len(values) != len(test) or not np.isfinite(values).all():
+            raise ValueError(f"{name} test predictions are invalid.")
+        if ((values < 0) | (values > 1)).any():
+            raise ValueError(f"{name} test predictions must be probabilities in [0, 1].")
+        predictions[name] = values
+    return predictions
+
+
 def build_oof_predictions(
     results: Sequence[ExperimentResult],
     index: pd.Index,
@@ -1724,6 +2290,7 @@ def fit_full_and_predict_test(
 ) -> np.ndarray:
     """Fit one selected experiment on all train rows and predict test."""
     cfg = _merge_config(config)
+    feature_config = _resolve_feature_config(cfg, target_col)
     seed = int(cfg["random_state"])
     set_global_seed(seed)
     _validate_binary_target(train[target_col], target_col)
@@ -1769,7 +2336,6 @@ def fit_full_and_predict_test(
         "T3_tfidf_embedding_tabular_lr",
     } or experiment.startswith("E6_embedding_tabular_xgb")
     if uses_tabular:
-        feature_config = dict(cfg["feature_engineering"])
         train_table, numeric, categorical = prepare_tabular_features(
             train, numeric_cols, categorical_cols, **feature_config
         )
@@ -1915,6 +2481,7 @@ def run_all_experiments(
 ) -> ExperimentSuiteResult:
     """Run enabled E1-E6/T1-T3 with exactly the supplied time folds."""
     cfg = _merge_config(config)
+    feature_config = _resolve_feature_config(cfg, target_col)
     metric = _validate_metric(str(cfg["metric"]))
     seed = int(cfg["random_state"])
     common = {
@@ -1961,7 +2528,7 @@ def run_all_experiments(
                 categorical_cols,
                 embedding_scaling=str(cfg["embedding_scaling"]),
                 lr_config=cfg["lr"],
-                feature_config=cfg["feature_engineering"],
+                feature_config=feature_config,
                 **embedding_common,
             )
         )
@@ -1988,7 +2555,7 @@ def run_all_experiments(
                 categorical_cols,
                 embedding_scaling=str(cfg["embedding_scaling"]),
                 mlp_config=cfg["mlp"],
-                feature_config=cfg["feature_engineering"],
+                feature_config=feature_config,
                 **embedding_common,
             )
         )
@@ -2000,7 +2567,7 @@ def run_all_experiments(
                 numeric_cols,
                 categorical_cols,
                 catboost_config=cfg["catboost"],
-                feature_config=cfg["feature_engineering"],
+                feature_config=feature_config,
                 **common,
             )
         )
@@ -2019,7 +2586,7 @@ def run_all_experiments(
                     categorical_cols,
                     pca_dim=pca_dim,
                     xgboost_config=cfg["xgboost"],
-                    feature_config=cfg["feature_engineering"],
+                    feature_config=feature_config,
                     **embedding_common,
                 )
             )
@@ -2042,7 +2609,7 @@ def run_all_experiments(
         embedding_scaling=str(cfg["embedding_scaling"]),
         tfidf_config=cfg["tfidf"],
         tfidf_lr_config=cfg["tfidf_lr"],
-        feature_config=cfg["feature_engineering"],
+        feature_config=feature_config,
         tfidf_feature_output_dir=cfg["tfidf_feature_output_dir"],
         random_state=seed,
     )
@@ -2121,10 +2688,13 @@ def run_all_experiments(
 __all__ = [
     "ExperimentResult",
     "ExperimentSuiteResult",
+    "S1_TFIDF_SVD_MLP",
+    "S2_TFIDF_SVD_XGB",
     "build_experiment_summary",
     "build_oof_predictions",
     "default_modeling_config",
     "fit_full_and_predict_test",
+    "fit_full_tfidf_svd_nonlinear_and_predict_test",
     "prepare_tabular_features",
     "run_all_experiments",
     "run_e1_embedding_lr",
@@ -2134,6 +2704,7 @@ __all__ = [
     "run_e5_tabular_catboost",
     "run_e6_embedding_tabular_xgboost",
     "run_tfidf_lr_experiments",
+    "run_tfidf_svd_nonlinear_experiments",
     "save_experiment_outputs",
     "set_global_seed",
     "validate_embedding_input",
