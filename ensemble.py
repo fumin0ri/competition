@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,6 +28,98 @@ class HillClimbingEnsembleResult:
     pooled_auc: float
     fold_scores: pd.DataFrame
     fold_weights: pd.Series
+
+
+def combine_embedding_oof_sources(
+    prediction_sources: Mapping[str, pd.DataFrame],
+    *,
+    embedding_free_models: Collection[str],
+    shared_source: str,
+    separator: str = "__",
+) -> pd.DataFrame:
+    """Combine OOF frames while namespacing only embedding-dependent models.
+
+    Models in ``embedding_free_models`` are copied once from ``shared_source``.
+    Every other column is renamed to ``<source><separator><model>`` so the same
+    experiment trained with different embedding providers remains a distinct
+    hill-climbing candidate.
+    """
+    if not prediction_sources:
+        raise ValueError("prediction_sources must contain at least one OOF frame.")
+    if shared_source not in prediction_sources:
+        raise KeyError(f"shared_source {shared_source!r} is not in prediction_sources.")
+    if not separator:
+        raise ValueError("separator must not be empty.")
+
+    source_names = list(prediction_sources)
+    if any(not isinstance(name, str) or not name for name in source_names):
+        raise ValueError("Every prediction source name must be a non-empty string.")
+    if any(separator in name for name in source_names):
+        raise ValueError("Prediction source names must not contain the separator.")
+
+    reference_index = prediction_sources[shared_source].index
+    if not reference_index.is_unique:
+        raise ValueError("OOF source index must be unique.")
+    shared = set(embedding_free_models)
+    blocks: list[pd.DataFrame] = []
+    output_names: set[str] = set()
+
+    for source, frame in prediction_sources.items():
+        if not isinstance(frame, pd.DataFrame):
+            raise TypeError(f"OOF source {source!r} must be a pandas DataFrame.")
+        if not frame.index.equals(reference_index):
+            raise ValueError("Every OOF source must have exactly the same label index.")
+        if not frame.columns.is_unique:
+            raise ValueError(f"OOF source {source!r} contains duplicate model names.")
+
+        selected: dict[str, str] = {}
+        for model in frame.columns:
+            if not isinstance(model, str) or not model:
+                raise ValueError("Every OOF model name must be a non-empty string.")
+            if model in shared:
+                if source != shared_source:
+                    continue
+                output_name = model
+            else:
+                output_name = f"{source}{separator}{model}"
+            if output_name in output_names:
+                raise ValueError(f"Duplicate combined OOF model name: {output_name!r}")
+            selected[model] = output_name
+            output_names.add(output_name)
+
+        if selected:
+            blocks.append(frame.loc[:, list(selected)].rename(columns=selected))
+
+    if not blocks:
+        raise ValueError("No OOF prediction columns were selected.")
+    return pd.concat(blocks, axis=1)
+
+
+def split_prediction_namespace(
+    prediction_name: str,
+    *,
+    namespaces: Collection[str],
+    separator: str = "__",
+) -> tuple[str | None, str]:
+    """Return ``(embedding_source, base_experiment)`` for a combined name."""
+    if not isinstance(prediction_name, str) or not prediction_name:
+        raise ValueError("prediction_name must be a non-empty string.")
+    if not separator:
+        raise ValueError("separator must not be empty.")
+    matches = [
+        source
+        for source in namespaces
+        if prediction_name.startswith(f"{source}{separator}")
+    ]
+    if len(matches) > 1:
+        raise ValueError(f"Ambiguous prediction namespace for {prediction_name!r}.")
+    if not matches:
+        return None, prediction_name
+    source = matches[0]
+    experiment = prediction_name[len(source) + len(separator) :]
+    if not experiment:
+        raise ValueError("Namespaced prediction name is missing its experiment name.")
+    return source, experiment
 
 
 def _resolve_target(target: pd.Series | Sequence[int], index: pd.Index) -> pd.Series:
@@ -607,9 +699,11 @@ def save_ensemble_outputs(
 __all__ = [
     "HillClimbingEnsembleResult",
     "blend_test_predictions",
+    "combine_embedding_oof_sources",
     "evaluate_fold_auc",
     "hill_climb_auc",
     "make_profile_submissions",
     "make_submission",
     "save_ensemble_outputs",
+    "split_prediction_namespace",
 ]

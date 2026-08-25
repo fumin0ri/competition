@@ -7,11 +7,13 @@ import pandas as pd
 
 from ensemble import (
     blend_test_predictions,
+    combine_embedding_oof_sources,
     evaluate_fold_auc,
     hill_climb_auc,
     make_profile_submissions,
     make_submission,
     save_ensemble_outputs,
+    split_prediction_namespace,
 )
 
 
@@ -54,6 +56,47 @@ class EnsembleTests(unittest.TestCase):
     def test_rejects_target_index_mismatch(self):
         with self.assertRaisesRegex(ValueError, "target index"):
             hill_climb_auc(self.oof, self.target.reset_index(drop=True))
+
+    def test_combines_embedding_sources_without_duplicate_shared_models(self):
+        cohere = self.oof.rename(
+            columns={"model_a": "E1_embedding_lr", "model_b": "T1_tfidf_lr"}
+        )
+        titan = cohere.copy()
+        titan["E1_embedding_lr"] = titan["E1_embedding_lr"] * 0.9
+        combined = combine_embedding_oof_sources(
+            {"cohere": cohere, "titan": titan},
+            embedding_free_models={"T1_tfidf_lr"},
+            shared_source="cohere",
+        )
+        self.assertEqual(
+            combined.columns.tolist(),
+            ["cohere__E1_embedding_lr", "T1_tfidf_lr", "titan__E1_embedding_lr"],
+        )
+        pd.testing.assert_series_equal(
+            combined["T1_tfidf_lr"], cohere["T1_tfidf_lr"]
+        )
+
+    def test_combining_embedding_sources_rejects_index_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "same label index"):
+            combine_embedding_oof_sources(
+                {"cohere": self.oof, "titan": self.oof.reset_index(drop=True)},
+                embedding_free_models=set(),
+                shared_source="cohere",
+            )
+
+    def test_splits_namespaced_and_shared_prediction_names(self):
+        self.assertEqual(
+            split_prediction_namespace(
+                "titan__E1_embedding_lr", namespaces={"cohere", "titan"}
+            ),
+            ("titan", "E1_embedding_lr"),
+        )
+        self.assertEqual(
+            split_prediction_namespace(
+                "T1_tfidf_lr", namespaces={"cohere", "titan"}
+            ),
+            (None, "T1_tfidf_lr"),
+        )
 
     def test_evaluate_fold_auc_uses_label_indices_and_reports_year(self):
         result = hill_climb_auc(self.oof, self.target, weight_grid=[0.15])

@@ -429,8 +429,9 @@ CatBoostのGPU学習は公式仕様上、同じseedでもbitwise deterministic�
 2. 5行のCohere API smoke test
 3. resumableなtrain/test Embedding生成または既存cache読込
 4. 同一時系列foldでE1〜E6 / T1〜T3を比較
-5. 年度重みを変えたROC-AUC hill climbing
-6. 全train再fitと複数submission作成
+5. Notebook 04のTitan OOFとCohere OOFを結合
+6. 年度重みを変えたROC-AUC hill climbing
+7. Titan/Cohereの選抜モデルを全train再fitして複数submission作成
 
 Cohere Embed v3は分類用途として`input_type="classification"`、長文は`truncate="END"`を使います。出力は1024次元です。CohereのBedrock adapterは`embedding_features.py`に実装してあり、複数textを最大96件まで1 API callへまとめられます。Notebookの既定は32件/callです。単体テストでpayload、batch数、response shapeを検証しています。
 
@@ -444,12 +445,17 @@ RUN_ENSEMBLE = True
 RUN_FINAL_SUBMISSION = True
 ```
 
-既存Embeddingを再利用するときはAPIフラグを無効にし、`EXISTING_COHERE_CACHE_DIR`へcache directoryを指定します。結果はTitanなどの既存実験と混ざらないよう、次へ保存します。
+既存Embeddingを再利用するときはAPIフラグを無効にし、`EXISTING_COHERE_CACHE_DIR`へcache directoryを指定します。Titanもensembleへ入れる既定設定では、先にNotebook 04を実行して`outputs/oof_predictions.parquet`を作成します。最終submission時にはNotebook 03で生成したTitan cacheを`TITAN_EMBEDDING_CACHE_DIR`へ指定してください。
+
+統合時はEmbedding依存モデルを`cohere__E1_embedding_lr`、`titan__E1_embedding_lr`のように別候補にします。Embeddingを使わないE5/T1/T2は同じ特徴・モデルの重複を避けるため、Cohere側から一度だけ採用します。Cohere単独のCV成果物と、統合ensemble成果物は次のように分離されます。
 
 ```text
 outputs/cohere/
 ├── oof_predictions.parquet
-├── experiment_summary.csv
+└── experiment_summary.csv
+
+outputs/cohere_titan_ensemble/
+├── oof_predictions.parquet
 ├── ensemble_profile_comparison.csv
 ├── ensembles/<profile>/
 ├── test_predictions/
