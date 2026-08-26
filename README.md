@@ -17,7 +17,8 @@ competition/
 │   ├── 04_embedding_models.ipynb
 │   ├── 05_cohere_embeddings_to_submission.ipynb
 │   ├── 06_tfidf_svd_nonlinear.ipynb
-│   └── 2_01_generate_ai_market_llm_features.ipynb
+│   ├── 2_01_generate_ai_market_llm_features.ipynb
+│   └── 2_02_analyze_ai_market_themes.ipynb
 ├── outputs/                    # モデルOOF・評価・test予測（Git管理対象外）
 ├── tests/
 │   ├── test_validation.py
@@ -25,11 +26,13 @@ competition/
 │   ├── test_embedding_features.py
 │   ├── test_modeling.py
 │   ├── test_ensemble.py
-│   └── test_llm_features.py
+│   ├── test_llm_features.py
+│   └── test_market_analysis.py
 ├── requirements.txt
 ├── embedding_features.py      # Amazon Bedrock Embedding・resume・保存
 ├── ensemble.py                # AUC hill climbing・test blend・submission
 ├── llm_features.py            # 官公庁AI市場分析用LLM分類・validation・resume
+├── market_analysis.py         # AIU重点テーマの集計・HHI・スコアリング
 ├── modeling.py                # E1〜E6 / T1〜T3の統一比較
 ├── text_features.py           # char TF-IDF・Logistic Regression
 ├── validation.py              # CV・seen/unseen判定
@@ -500,6 +503,27 @@ data/csv/
 ```
 
 canonical CSVには元の`project_id`、`source_split`、`source_index`、API用一意キー、分類結果、model、prompt version、token数、retry数を保存します。`ai_usecase`は`U02|U05`形式で、`decode_ai_usecase()`からlistへ戻せます。
+
+## AIU重点テーマ分析
+
+`notebooks/2_02_analyze_ai_market_themes.ipynb`は、Notebook 2_01の保存済み分類結果を読み込み、`admin_process × ai_usecase`を1テーマとして可視化・順位付けします。LLM APIは再度呼びません。`source_split + project_id`で元のtrain/testへone-to-one結合し、対象は`project_start_year >= 2020`だけです。
+
+各テーマでは、High-app事業数・High-app率・省庁breadth・policy domain breadth・省庁/domainのHHI・明示的ルールによるAIU Fitを計算します。High-appは`ai_applicability == 2`だけを指します。生のHigh-app率と、全体率を事前値・強度20件として平滑化した順位用の率を分けて保存します。複数ラベルの`ai_usecase`はexplodeし、`U99`とHigh-app 0件のテーマはランキング対象外です。
+
+初期の総合重みは、High-app件数20%、平滑化率15%、省庁breadth15%、domain breadth10%、低集中度10%、AIU Fit30%です。Notebook上部の辞書・重みを編集でき、戦略重視・均等・市場規模重視の順位感度も比較します。
+
+```text
+data/csv/
+├── ai_market_theme_metrics.csv
+└── ai_market_theme_yearly_metrics.csv
+
+outputs/ai_market_themes/
+├── top_themes.csv
+├── weight_profile_comparison.csv
+└── *.png
+```
+
+入力CSVと`data/csv/ai_market_llm_features.csv.gz`を配置した後、Notebookを上から実行してください。結合漏れ、重複キー、年度不一致、未知taxonomyがある場合は分析を停止します。
 
 ## TF-IDF SVD + MLP/XGBoost
 
