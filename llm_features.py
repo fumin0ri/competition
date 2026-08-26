@@ -230,6 +230,21 @@ def build_project_text(
     return "\n\n".join(sections)
 
 
+def filter_projects_by_start_year(
+    df: pd.DataFrame,
+    *,
+    year_col: str = "project_start_year",
+    min_year: int = 2020,
+) -> pd.DataFrame:
+    """Return a copy of rows on/after ``min_year`` without mutating ``df``."""
+    if year_col not in df.columns:
+        raise KeyError(f"Missing year column: {year_col}")
+    if isinstance(min_year, bool) or not isinstance(min_year, int):
+        raise ValueError("min_year must be an integer.")
+    numeric_year = pd.to_numeric(df[year_col], errors="coerce")
+    return df.loc[numeric_year.ge(min_year)].copy()
+
+
 def build_classification_prompt(project_text: str) -> str:
     """Build one user message without asking the model for market evaluation."""
     return (
@@ -975,6 +990,7 @@ __all__ = [
     "build_tool_config",
     "call_bedrock_converse",
     "decode_ai_usecase",
+    "filter_projects_by_start_year",
     "generate_llm_features",
     "load_llm_features",
     "parse_bedrock_converse_response",

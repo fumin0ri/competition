@@ -10,6 +10,7 @@ from llm_features import (
     FeatureValidationError,
     build_project_text,
     decode_ai_usecase,
+    filter_projects_by_start_year,
     generate_llm_features,
     load_llm_features,
     parse_feature_payload,
@@ -75,6 +76,20 @@ class LLMFeatureTests(unittest.TestCase):
         self.assertIn("事業名:\n中小企業支援", text)
         self.assertIn("事業目的:\n申請企業を支援する", text)
         self.assertIn("現状・課題:\n[欠損]", text)
+
+    def test_filter_projects_keeps_only_numeric_years_from_2020(self):
+        frame = pd.DataFrame(
+            {
+                "project_start_year": [2019, "2020", 2022, -1, None, "unknown"],
+                "value": list("abcdef"),
+            },
+            index=[10, 20, 30, 40, 50, 60],
+        )
+        original = frame.copy(deep=True)
+        filtered = filter_projects_by_start_year(frame, min_year=2020)
+        self.assertEqual(filtered.index.tolist(), [20, 30])
+        self.assertEqual(filtered["value"].tolist(), ["b", "c"])
+        pd.testing.assert_frame_equal(frame, original)
 
     def test_parse_plain_and_fenced_json(self):
         plain = parse_feature_payload(json.dumps(VALID_FEATURES, ensure_ascii=False))

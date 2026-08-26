@@ -470,7 +470,7 @@ outputs/cohere_titan_ensemble/
 
 ## 官公庁AI市場分析用LLM特徴量
 
-`notebooks/2_01_generate_ai_market_llm_features.ipynb`は、既存のtrain/testを同じ行政事業群として扱い、次の5列をAmazon Bedrockで生成します。
+`notebooks/2_01_generate_ai_market_llm_features.ipynb`は、train/testそれぞれの`project_start_year >= 2020`の行だけを同じ行政事業群として扱い、次の5列をAmazon Bedrockで生成します。年度は対象抽出と出力メタデータに使いますが、LLM本文には送りません。`-1`、欠損、解釈不能な年度、2019年以前は対象外です。
 
 - `policy_domain`: D01〜D15から1件
 - `admin_process`: A01〜A13から1件
@@ -480,7 +480,7 @@ outputs/cohere_titan_ensemble/
 
 AIU fit、市場性、期待効果、scalability等はLLMに出力させません。`llm_features.py`が余分な列を含むresponseも拒否し、U99と`ai_applicability=0`の整合性を含めて機械的にvalidationします。
 
-既定候補は低コストのAmazon Nova Microです。AWS公式の[model card](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-amazon-nova-micro.html)によるとConverseとtool useに対応しますが、厳密なStructured OutputsとTokyo in-regionには対応していません。そのため、強制tool callとローカルvalidationを併用し、Notebook既定リージョンは`us-east-1`です。リージョン要件がある場合は、利用可能な別モデル・model ID・現行単価へ変更してください。
+既定候補は低コストのAmazon Nova Microです。AWS公式の[model card](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-amazon-nova-micro.html)によるとConverseとtool useに対応しますが、厳密なStructured OutputsとTokyo in-regionには対応していません。そのため、強制tool callとローカルvalidationを併用し、Notebook既定リージョンは`us-east-1`です。リージョン要件がある場合は、利用可能な別モデルへ変更してください。モデル変更時は`MODEL_ID`だけでなく、`REGION_NAME`、入力・出力単価、model access、tool use/toolChoice対応、モデル固有の追加request fieldsも確認します。
 
 初期状態では`RUN_SAMPLE_API=False`、`RUN_FULL_API=False`です。全件dry-runで件数・最大token・最大費用・sample promptを確認し、10件sampleの分類品質を人手確認してから全件処理します。単価は実行日に[AWS公式料金](https://aws.amazon.com/bedrock/pricing/)を再確認してください。
 
@@ -490,10 +490,10 @@ AIU fit、市場性、期待効果、scalability等はLLMに出力させませ�
 data/llm_features/bedrock_<model>_<prompt-version>_<config-hash>/
 ├── config.json
 ├── failures.jsonl
-├── shards/all_projects/<row-position>.json
-├── all_projects_features.csv.gz
-├── all_projects_errors.csv.gz
-└── all_projects_progress.json
+├── shards/projects_start_year_2020_plus/<row-position>.json
+├── projects_start_year_2020_plus_features.csv.gz
+├── projects_start_year_2020_plus_errors.csv.gz
+└── projects_start_year_2020_plus_progress.json
 
 data/csv/
 └── ai_market_llm_features.csv.gz
