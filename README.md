@@ -18,7 +18,8 @@ competition/
 │   ├── 05_cohere_embeddings_to_submission.ipynb
 │   ├── 06_tfidf_svd_nonlinear.ipynb
 │   ├── 2_01_generate_ai_market_llm_features.ipynb
-│   └── 2_02_analyze_ai_market_themes.ipynb
+│   ├── 2_02_analyze_ai_market_themes.ipynb
+│   └── 2_03_design_domain_services.ipynb
 ├── outputs/                    # モデルOOF・評価・test予測（Git管理対象外）
 ├── tests/
 │   ├── test_validation.py
@@ -27,13 +28,15 @@ competition/
 │   ├── test_modeling.py
 │   ├── test_ensemble.py
 │   ├── test_llm_features.py
-│   └── test_market_analysis.py
+│   ├── test_market_analysis.py
+│   └── test_service_analysis.py
 ├── requirements.txt
 ├── embedding_features.py      # Amazon Bedrock Embedding・resume・保存
 ├── ensemble.py                # AUC hill climbing・test blend・submission
 ├── llm_features.py            # 官公庁AI市場分析用LLM分類・validation・resume
 ├── market_analysis.py         # AIU重点テーマの集計・HHI・スコアリング
 ├── modeling.py                # E1〜E6 / T1〜T3の統一比較
+├── service_analysis.py        # 選定テーマのドメイン評価・サービス仮説
 ├── text_features.py           # char TF-IDF・Logistic Regression
 ├── validation.py              # CV・seen/unseen判定
 └── README.md
@@ -524,6 +527,31 @@ outputs/ai_market_themes/
 ```
 
 入力CSVと`data/csv/ai_market_llm_features.csv.gz`を配置した後、Notebookを上から実行してください。結合漏れ、重複キー、年度不一致、未知taxonomyがある場合は分析を停止します。
+
+## 選定テーマのドメイン・サービス設計
+
+`notebooks/2_03_design_domain_services.ipynb`は、Notebook 2_02で選んだテーマを、具体的な政策分野・重点省庁・提供サービスへ落とし込みます。`SELECTED_THEME_CODES`へテーマを指定し、空listの場合は2_02の総合上位3テーマを利用します。
+
+各テーマ内のpolicy domainを、High-app件数、平滑化率、省庁breadth・HHI、予算、直近件数、課題文充足率で順位付けします。予算列がない場合は予算の重みを利用可能な指標へ自動再配分します。さらに、年度推移、省庁アカウントマップ、予算の大型案件依存、特徴的な日本語char n-gram、代表事業を確認できます。
+
+サービス案はデータ観測値ではありません。`service_analysis.py`の編集可能なadmin process別コンサルティング観点とai usecase別サービスカタログから、診断・PoC・本番実装・ガバナンス・KPIの初期仮説を生成します。Notebookでは観測根拠とサービス仮説を別列で保存します。
+
+```text
+data/csv/
+├── ai_market_theme_domain_metrics.csv
+├── ai_market_theme_domain_yearly_metrics.csv
+├── ai_market_ministry_domain_opportunities.csv
+└── ai_market_distinctive_phrases.csv
+
+outputs/ai_market_service_design/
+├── service_opportunity_cards.csv
+├── service_portfolio_shortlist.csv
+├── ministry_account_shortlist.csv
+├── representative_high_app_projects.csv
+└── *.png
+```
+
+2_01、2_02、2_03の順に実行してください。特徴フレーズ抽出には`requirements.txt`のscikit-learnが必要です。
 
 ## TF-IDF SVD + MLP/XGBoost
 

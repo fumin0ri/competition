@@ -153,6 +153,13 @@ class MarketAnalysisTests(unittest.TestCase):
         )
         self.assertAlmostEqual(row["overall_score"], expected)
 
+    def test_missing_component_receives_zero_percentile_score(self):
+        metrics = compute_theme_metrics(build_theme_long(self.project_frame()))
+        target = metrics["theme_code"].eq("A01__U04")
+        metrics.loc[target, "concentration_hhi"] = np.nan
+        scored = score_theme_metrics(metrics).set_index("theme_code")
+        self.assertEqual(scored.loc["A01__U04", "low_concentration_score"], 0)
+
     def test_profile_comparison_has_score_and_rank_for_each_profile(self):
         metrics = compute_theme_metrics(build_theme_long(self.project_frame()))
         comparison = compare_weight_profiles(metrics)

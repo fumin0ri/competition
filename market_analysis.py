@@ -411,8 +411,10 @@ def score_theme_metrics(
     for name, values in inputs.items():
         column = f"{name}_score"
         scored[column] = np.nan
-        scored.loc[eligible, column] = values.loc[eligible].rank(
-            method="average", pct=True, na_option="bottom"
+        scored.loc[eligible, column] = 0.0
+        valid = eligible & values.notna()
+        scored.loc[valid, column] = values.loc[valid].rank(
+            method="average", pct=True
         ) * 100.0
         score_columns[name] = column
     scored["aiu_fit_score"] = np.where(eligible, scored["aiu_fit"] / 5.0 * 100.0, np.nan)
