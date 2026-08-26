@@ -16,17 +16,20 @@ competition/
 │   ├── 03_generate_embeddings.ipynb
 │   ├── 04_embedding_models.ipynb
 │   ├── 05_cohere_embeddings_to_submission.ipynb
-│   └── 06_tfidf_svd_nonlinear.ipynb
+│   ├── 06_tfidf_svd_nonlinear.ipynb
+│   └── 2_01_generate_ai_market_llm_features.ipynb
 ├── outputs/                    # モデルOOF・評価・test予測（Git管理対象外）
 ├── tests/
 │   ├── test_validation.py
 │   ├── test_text_features.py
 │   ├── test_embedding_features.py
 │   ├── test_modeling.py
-│   └── test_ensemble.py
+│   ├── test_ensemble.py
+│   └── test_llm_features.py
 ├── requirements.txt
 ├── embedding_features.py      # Amazon Bedrock Embedding・resume・保存
 ├── ensemble.py                # AUC hill climbing・test blend・submission
+├── llm_features.py            # 官公庁AI市場分析用LLM分類・validation・resume
 ├── modeling.py                # E1〜E6 / T1〜T3の統一比較
 ├── text_features.py           # char TF-IDF・Logistic Regression
 ├── validation.py              # CV・seen/unseen判定
@@ -464,6 +467,39 @@ outputs/cohere_titan_ensemble/
 │   └── submission_manifest.csv
 └── submission.csv
 ```
+
+## 官公庁AI市場分析用LLM特徴量
+
+`notebooks/2_01_generate_ai_market_llm_features.ipynb`は、既存のtrain/testを同じ行政事業群として扱い、次の5列をAmazon Bedrockで生成します。
+
+- `policy_domain`: D01〜D15から1件
+- `admin_process`: A01〜A13から1件
+- `ai_usecase`: U01〜U11またはU99から1〜3件
+- `ai_applicability`: 0 / 1 / 2
+- `classification_reason`: 人間による監査用の説明
+
+AIU fit、市場性、期待効果、scalability等はLLMに出力させません。`llm_features.py`が余分な列を含むresponseも拒否し、U99と`ai_applicability=0`の整合性を含めて機械的にvalidationします。
+
+既定候補は低コストのAmazon Nova Microです。AWS公式の[model card](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-amazon-nova-micro.html)によるとConverseとtool useに対応しますが、厳密なStructured OutputsとTokyo in-regionには対応していません。そのため、強制tool callとローカルvalidationを併用し、Notebook既定リージョンは`us-east-1`です。リージョン要件がある場合は、利用可能な別モデル・model ID・現行単価へ変更してください。
+
+初期状態では`RUN_SAMPLE_API=False`、`RUN_FULL_API=False`です。全件dry-runで件数・最大token・最大費用・sample promptを確認し、10件sampleの分類品質を人手確認してから全件処理します。単価は実行日に[AWS公式料金](https://aws.amazon.com/bedrock/pricing/)を再確認してください。
+
+成功した行は1件ずつcheckpointされます。同じmodel、prompt version、入力列、推論設定で再実行すると成功済み行を再利用し、未処理・失敗行だけを呼び出します。見積り時と実行中の両方で`MAX_BUDGET_USD=20`を検査します。
+
+```text
+data/llm_features/bedrock_<model>_<prompt-version>_<config-hash>/
+├── config.json
+├── failures.jsonl
+├── shards/all_projects/<row-position>.json
+├── all_projects_features.csv.gz
+├── all_projects_errors.csv.gz
+└── all_projects_progress.json
+
+data/csv/
+└── ai_market_llm_features.csv.gz
+```
+
+canonical CSVには元の`project_id`、`source_split`、`source_index`、API用一意キー、分類結果、model、prompt version、token数、retry数を保存します。`ai_usecase`は`U02|U05`形式で、`decode_ai_usecase()`からlistへ戻せます。
 
 ## TF-IDF SVD + MLP/XGBoost
 
